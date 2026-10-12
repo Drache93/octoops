@@ -399,6 +399,7 @@ function seed(config, opts = {}) {
     const existing = state[key] || {}
     if (existing.secrets) entry.secrets = existing.secrets
     if (existing.envSecrets) entry.envSecrets = existing.envSecrets
+    if (existing.npmTrust) entry.npmTrust = existing.npmTrust
     if (raw.renamedFrom) entry.renamedFrom = raw.renamedFrom
     if (repo.archived) entry.archived = true
     if (repo.description !== undefined) entry.description = repo.description
@@ -499,7 +500,20 @@ async function resync(config, opts = {}) {
     fresh.teams = fresh.teams.filter((t) => keep.has(t.name))
   }
 
-  if (opts.statePath) saveState(opts.statePath, {})
+  // tombstones for repos still marked deleted survive the resync, GitHub has
+  // nothing to import for them and losing one means one more DELETE/404 round.
+  // the npm publisher clock lives only in state, nothing on GitHub can rebuild it
+  const kept = {}
+  if (opts.statePath) {
+    const old = loadState(opts.statePath)
+    for (const r of config.repos || []) {
+      const key = config.org + '/' + r.name
+      const was = old[key] || {}
+      if (r.deleted === true && was.deleted === true) kept[key] = was
+      else if (was.npmTrust) kept[key] = { npmTrust: was.npmTrust }
+    }
+    saveState(opts.statePath, kept)
+  }
   seed(fresh, opts)
 }
 
@@ -639,13 +653,19 @@ async function apply(config, opts = {}) {
       const key = config.org + '/' + raw.name
       if (raw.deleted === true) {
         if (!raw.name) throw new Error('repo "deleted" requires a "name"')
+        // a tombstone records the delete so later applies do not hit GitHub again
+        if ((state[key] || {}).deleted === true) continue
         await deleteRepo(config.org, raw.name, dry)
         if (!dry) {
-          delete state[key]
+          state[key] = { deleted: true }
           if (opts.statePath) saveState(opts.statePath, state)
         }
         continue
       }
+
+      // the entry lost its deleted flag, so the repo is wanted again. drop the
+      // tombstone so the reconcile below sees no state and creates it
+      if ((state[key] || {}).deleted === true) delete state[key]
 
       const repo = resolve(resolveDefaults(raw, config.defaults), presets)
       // a rename is one-shot, state records which renamedFrom it already handled.
@@ -670,6 +690,7 @@ async function apply(config, opts = {}) {
       const done = {}
       try {
         await reconcile(config.org, repo, prev, dry, done, opts)
+        await reconcileNpmTrust(config.org, repo, prev, dry, done, opts)
       } catch (err) {
         if (err.message && err.message.includes('archived')) {
           print(dry, 'skip-archived', `${config.org}/${repo.name}`)
@@ -2480,18 +2501,43 @@ async function ensureNpmPackage(pkg, dry) {
 
 async function reconcileNpmBlock(org, repo, prev, dry, done) {
   if (!repo.npm) return
+  const trust = { ...(prev.npmTrust || {}) }
   if (changed(repo.npm, prev.npm)) {
     const npms = Array.isArray(repo.npm) ? repo.npm : [repo.npm]
-    for (const npm of npms) await reconcileNpm(org, repo.name, npm, dry)
+    for (const npm of npms) await reconcileNpm(org, repo.name, npm, dry, trust)
   }
   // record only after the work succeeded — if reconcileNpm threw (e.g. npm
   // publish failed because not logged in) we leave state unchanged so the
   // next apply retries instead of assuming it's done
   done.npm = repo.npm
+  if (!dry && changed(trust, prev.npmTrust || {})) done.npmTrust = trust
 }
 
-async function reconcileNpm(org, repoName, npm, dry) {
-  const pkg = npm.package || npm.name || (npm.scope ? (npm.scope.startsWith('@') ? npm.scope : '@' + npm.scope) + '/' + repoName : repoName)
+function npmPackageName(npm, repoName) {
+  return npm.package || npm.name || (npm.scope ? (npm.scope.startsWith('@') ? npm.scope : '@' + npm.scope) + '/' + repoName : repoName)
+}
+
+function desiredTrustedPublishers(org, repoName, tp) {
+  const repository = `${org}/${repoName}`
+  const seen = new Set()
+  const desired = []
+
+  for (const e of Array.isArray(tp) ? tp : [tp]) {
+    if (!e.workflow) {
+      throw new Error('npm.trustedPublishing.workflow is required for ' + repository)
+    }
+    const entry = { repository, file: e.workflow, environment: e.environment || null }
+    // declaring the same triple twice would make the second npm trust call fail
+    if (seen.has(trustKey(entry))) continue
+    seen.add(trustKey(entry))
+    desired.push(entry)
+  }
+
+  return desired
+}
+
+async function reconcileNpm(org, repoName, npm, dry, trust) {
+  const pkg = npmPackageName(npm, repoName)
   const tp = npm.trustedPublishing
 
   if (!tp && !npm.maintainers && npm.deprecated === undefined) return true
@@ -2509,26 +2555,24 @@ async function reconcileNpm(org, repoName, npm, dry) {
 
   if (!tp) return ok
 
-  const repository = `${org}/${repoName}`
-  const seen = new Set()
-  const desired = []
-
-  for (const e of Array.isArray(tp) ? tp : [tp]) {
-    if (!e.workflow) {
-      throw new Error('npm.trustedPublishing.workflow is required for ' + org + '/' + repoName)
-    }
-    const entry = { repository, file: e.workflow, environment: e.environment || null }
-    // declaring the same triple twice would make the second npm trust call fail
-    if (seen.has(trustKey(entry))) continue
-    seen.add(trustKey(entry))
-    desired.push(entry)
-  }
+  const desired = desiredTrustedPublishers(org, repoName, tp)
 
   if (dry) {
     for (const d of desired) print(dry, 'npm-trust', pkg, `${d.repository} via ${d.file}`)
     return ok
   }
 
+  const added = await syncTrustedPublishers(pkg, `${org}/${repoName}`, desired, false)
+  // a new publisher starts npm's publish-or-expire clock, see reconcileNpmTrust
+  if (added) trust[pkg] = { setAt: new Date().toISOString(), confirmed: false }
+
+  return ok
+}
+
+// lists what npm has for the package and converges it on desired. renew throws
+// every publisher of this repo away and recreates it, which is how npm's
+// expiry clock gets reset. returns how many publishers were created
+async function syncTrustedPublishers(pkg, repository, desired, renew) {
   console.log(
     '\n  When authenticating with npm, check the box to allow 5 minutes of non-authenticated access.\n'
   )
@@ -2543,34 +2587,156 @@ async function reconcileNpm(org, repoName, npm, dry) {
   // or to a provider other than GitHub, are not ours to revoke
   const current = listed.filter((c) => c.type === 'github' && typeof c.repository === 'string' && sameName(c.repository, repository))
 
-  const { add, revoke } = planTrustedPublishers(current, desired)
+  const { add, revoke } = renew ? { add: desired, revoke: current } : planTrustedPublishers(current, desired)
 
-  for (const d of add) print(dry, 'npm-trust', pkg, `${d.repository} via ${d.file}`)
-  for (const c of revoke) print(dry, 'npm-untrust', pkg, `${c.repository} via ${c.file}`)
+  for (const d of add) print(false, 'npm-trust', pkg, `${d.repository} via ${d.file}`)
+  for (const c of revoke) print(false, 'npm-untrust', pkg, `${c.repository} via ${c.file}`)
+
+  const addAll = async () => {
+    for (const d of add) {
+      const setArgs = [
+        'trust',
+        'github',
+        pkg,
+        '--file',
+        d.file,
+        '--repository',
+        d.repository,
+        '--allow-publish',
+        '--yes'
+      ]
+      if (d.environment) setArgs.push('--environment', d.environment)
+      await run('npm', setArgs, { interactive: true })
+    }
+  }
+
+  const revokeAll = async () => {
+    for (const c of revoke) {
+      if (c.id) await run('npm', ['trust', 'revoke', pkg, '--id', c.id], { interactive: true })
+    }
+  }
 
   // add before revoke so an interrupted run leaves too many publishers rather
-  // than none, and a failing add aborts before anything is taken away
-  for (const d of add) {
-    const setArgs = [
-      'trust',
-      'github',
-      pkg,
-      '--file',
-      d.file,
-      '--repository',
-      d.repository,
-      '--allow-publish',
-      '--yes'
-    ]
-    if (d.environment) setArgs.push('--environment', d.environment)
-    await run('npm', setArgs, { interactive: true })
+  // than none, and a failing add aborts before anything is taken away. a renewal
+  // has to go the other way round, npm refuses to create a triple that exists
+  if (renew) {
+    await revokeAll()
+    await addAll()
+  } else {
+    await addAll()
+    await revokeAll()
   }
 
-  for (const c of revoke) {
-    if (c.id) await run('npm', ['trust', 'revoke', pkg, '--id', c.id], { interactive: true })
+  return add.length
+}
+
+// npm expires a trusted publisher that has not published within two days of
+// being created. we cannot see that clock, so state keeps our own: when octoops
+// last created the publishers for a package, and whether the registry has seen
+// a provenance publish since (which only the publisher can produce). confirmed
+// packages are never looked at again. unconfirmed ones are left alone until our
+// clock says npm's has run out, then the registry decides: a provenance publish
+// confirms them, otherwise the publishers are recreated. so a package costs at
+// most one registry read per window, and a steady-state apply costs none
+const NPM_TRUST_RENEW_AFTER = 40 * 60 * 60 * 1000
+// setAt is this machine's clock, the publish times are the registry's
+const NPM_TRUST_CLOCK_SLACK = 10 * 60 * 1000
+
+async function reconcileNpmTrust(org, repo, prev, dry, done, opts) {
+  const trust = { ...(done.npmTrust || prev.npmTrust || {}) }
+  const before = JSON.stringify(trust)
+  const tracked = new Set()
+
+  // an archived repo cannot run its workflow, so there is nothing to confirm
+  if (repo.npm && !repo.archived) {
+    const npms = Array.isArray(repo.npm) ? repo.npm : [repo.npm]
+    for (const npm of npms) {
+      if (!npm.trustedPublishing) continue
+      const desired = desiredTrustedPublishers(org, repo.name, npm.trustedPublishing)
+      if (!desired.length) continue
+      const pkg = npmPackageName(npm, repo.name)
+      tracked.add(pkg)
+      await checkNpmTrust(pkg, `${org}/${repo.name}`, desired, trust, dry, opts)
+    }
   }
 
-  return ok
+  for (const pkg of Object.keys(trust)) {
+    if (!tracked.has(pkg)) delete trust[pkg]
+  }
+
+  if (!dry && JSON.stringify(trust) !== before) done.npmTrust = trust
+}
+
+async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
+  const entry = trust[pkg]
+  if (entry && entry.confirmed) return
+
+  const setAt = entry && entry.setAt ? Date.parse(entry.setAt) : 0
+  if (setAt && Date.now() - setAt < NPM_TRUST_RENEW_AFTER) return
+
+  let packument
+  try {
+    packument = await fetchPackument(pkg)
+  } catch (err) {
+    // a registry hiccup is no reason to guess, the next apply looks again
+    print(dry, 'npm-trust-skip', pkg, 'could not read registry: ' + err.message)
+    return
+  }
+
+  // first sight of this package, state predates the tracking or was seeded.
+  // any provenance publish proves the publisher works, otherwise the clock
+  // starts now since nothing can say when npm's did
+  if (!setAt) {
+    if (hasProvenanceSince(packument, 0)) {
+      print(dry, 'npm-trust-confirmed', pkg, 'provenance publish found')
+      trust[pkg] = { confirmed: true }
+    } else {
+      print(dry, 'npm-trust-track', pkg, 'no provenance publish yet')
+      trust[pkg] = { setAt: new Date().toISOString(), confirmed: false }
+    }
+    return
+  }
+
+  if (hasProvenanceSince(packument, setAt - NPM_TRUST_CLOCK_SLACK)) {
+    print(dry, 'npm-trust-confirmed', pkg, 'provenance publish after ' + entry.setAt)
+    trust[pkg] = { confirmed: true }
+    return
+  }
+
+  if (opts.renew === false) {
+    print(dry, 'npm-trust-expired', pkg, 'set ' + entry.setAt + ', not renewing')
+    return
+  }
+
+  print(dry, 'npm-trust-renew', pkg, 'no provenance publish since ' + entry.setAt)
+  if (dry) return
+
+  await syncTrustedPublishers(pkg, repository, desired, true)
+  trust[pkg] = { setAt: new Date().toISOString(), confirmed: false }
+}
+
+// the full packument, the abbreviated one drops both publish times and attestations.
+// null when the package does not exist
+async function fetchPackument(pkg) {
+  const res = await fetch('https://registry.npmjs.org/' + pkg.replace('/', '%2F'), {
+    headers: { accept: 'application/json' }
+  })
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error('registry returned ' + res.status)
+  return res.json()
+}
+
+// a version published through a trusted publisher carries a provenance
+// attestation. a token publish can add one too with --provenance, close enough
+function hasProvenanceSince(packument, since) {
+  if (!packument) return false
+  const time = packument.time || {}
+  for (const [version, data] of Object.entries(packument.versions || {})) {
+    const att = data.dist && data.dist.attestations
+    if (!att || !att.provenance) continue
+    if (Date.parse(time[version]) >= since) return true
+  }
+  return false
 }
 
 // npm prints one object per publisher, concatenated — never a JSON array — so

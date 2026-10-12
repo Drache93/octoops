@@ -185,7 +185,7 @@ Top-level repo fields for basic settings:
 - `issues: true|false` — enable/disable repo issues
 - `archived: true` — archive the repo (skips further reconcile). Removing this from the config (when state has it) unarchives the repo
 - `renamedFrom` — previous GitHub name of this repo. Apply renames that repo to `name` (keeping history) and moves the state entry, instead of creating a new empty repo. Once done it is recorded in state and not re-checked, so it is safe to leave in the config. If neither name exists on GitHub the repo is created as usual. Only on repo entries, not on defaults
-- `deleted: true` — delete the repo on GitHub and drop it from state. Must be set on the repo entry itself (ignored on defaults packs). Removing a repo from the config does **not** delete it. A 404 (already gone) is treated as success. After apply, remove the entry from the config
+- `deleted: true` — delete the repo on GitHub. Must be set on the repo entry itself (ignored on defaults packs). Removing a repo from the config does **not** delete it. A 404 (already gone) is treated as success. The delete is recorded in state as `{ "deleted": true }`, so the entry can stay in the config and later applies skip it without calling GitHub. Dropping the `deleted` flag again clears that record and the next apply recreates the repo. Remove the entry from the config once you no longer need the reminder
 - `init: true` — initialize the repo with a README so the default branch exists. On create, passes `--add-readme` to `gh repo create`. On an existing empty repo (no branches), creates `README.md` retroactively. GitHub names that initial branch itself (per the org's default), so if `defaultBranch` is also set and differs, octoops renames the branch to match (`rename-branch`). The rename only ever runs on the commit octoops just made — a repo with existing branches is never touched. Once initialized, recorded in state and not re-checked
 - `actionsAccess` — `"none"` | `"organization"` | `"enterprise"`. Controls which other repos' GitHub Actions workflows can access this repo's actions and reusable workflows (Settings → Actions → General → Access). Only relevant for private repos.
 - `forkPrContributorApproval` — `"all_external_contributors"` | `"first_time_contributors"` | `"first_time_contributors_new_to_github"`. Controls who must wait for approval before GitHub Actions runs on fork pull requests (Settings → Actions → General → Fork pull request workflows from outside collaborators).
@@ -830,6 +830,27 @@ An empty `trustedPublishing` list revokes every publisher this repo has on the p
 Needs npm **11.15.0 or newer**. Earlier versions have no `--allow-publish` flag on `npm trust github`, so every add fails with `EUSAGE`.
 
 `--dry-run` prints each declared publisher without reading the registry, so it shows what's declared rather than what would change.
+
+#### Expiry and renewal
+
+npm deletes a trusted publisher that hasn't published anything within two days of being created. Since octoops usually sets publishers up well before the first release, it tracks this itself. State keeps an `npmTrust` map per repo, keyed on package name:
+
+```json
+"npmTrust": {
+  "my-module": { "setAt": "2026-10-12T09:00:00.000Z", "confirmed": false }
+}
+```
+
+`setAt` is written whenever an apply creates a publisher. Until it is 40 hours old nothing happens and nothing is fetched. After that, every apply (whether or not the `npm` block changed) gives the package one unauthenticated read of the public registry:
+
+- A version with a provenance attestation published after `setAt` means the publisher has been used. The package is marked `confirmed` (`npm-trust-confirmed`) and never checked again.
+- Otherwise the publishers are revoked and recreated (`npm-trust-renew`, then the usual `npm-untrust`/`npm-trust` lines) and `setAt` starts over. This needs an npm login like any other publisher change. Pass `--no-renew` to only report (`npm-trust-expired`) without touching npm; the package is then checked again on the next apply.
+
+So a steady-state apply makes no registry requests at all, and a package costs at most one per window.
+
+Packages seen for the first time without a `setAt`, such as state from before this feature or a fresh `seed`/`resync`, are confirmed if any version at all carries provenance. If none does, the clock starts at that apply (`npm-trust-track`), so a publisher that already expired is recreated within two days instead of failing the next release. Archived repos are skipped: their workflow can't run, so there is nothing to confirm. Removing `trustedPublishing` from a package drops its tracking entry.
+
+Tracking is per package, not per workflow. Adding a second workflow to a confirmed package starts the clock again, and a later renewal recreates both. `seed` and `resync` carry the `npmTrust` map over since nothing on GitHub can rebuild it.
 
 You can also manage the package's npm maintainer list:
 
