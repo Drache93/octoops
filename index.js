@@ -1118,6 +1118,9 @@ async function reconcile(org, repo, prev, dry, done, opts) {
     // it even here; everything else on an archived repo is read-only, skip it.
     await reconcileNpmBlock(org, repo, prev, dry, done)
     if (!prev.archived) {
+      // an archived repo is frozen, so a repo that does not exist yet has to be
+      // created and initialized before the flag is flipped
+      await ensureRepo(org, repo, prev, dry, done)
       print(dry, 'archive', `${org}/${repo.name}`)
       if (!dry)
         await gh(['api', `repos/${org}/${repo.name}`, '--method', 'PATCH', '--input', '-'], {
@@ -1138,54 +1141,7 @@ async function reconcile(org, repo, prev, dry, done, opts) {
     delete prev.archived
   }
 
-  let current = Object.keys(prev).length > 0
-
-  if (!current) {
-    const existing = await getRepo(org, repo.name)
-    if (!existing) {
-      print(dry, 'create', `${org}/${repo.name}`)
-      if (!dry) {
-        await createRepo(org, repo)
-        await new Promise((resolve) => setTimeout(resolve, 2000))
-      }
-      // createRepo already sets description, homepage and visibility
-      if (repo.description !== undefined) prev.description = repo.description
-      if (repo.homepage !== undefined) prev.homepage = repo.homepage
-      if (repo.private !== undefined) prev.private = repo.private
-      if (repo.internal !== undefined) prev.internal = repo.internal
-      if (repo.init) done.initialized = true
-    }
-    current = true
-  }
-
-  if (repo.init && !prev.initialized) {
-    // the create path above sets this when gh repo create --add-readme made the initial commit
-    let initialized = done.initialized === true
-
-    if (!initialized) {
-      let branches = []
-      try {
-        branches = JSON.parse(await gh(['api', `repos/${org}/${repo.name}/branches`]))
-      } catch {}
-      if (branches.length === 0) {
-        print(dry, 'init-readme', `${org}/${repo.name}`)
-        if (!dry) {
-          await gh(['api', `repos/${org}/${repo.name}/contents/README.md`, '--method', 'PUT', '--input', '-'], {
-            body: {
-              message: 'Initial commit',
-              content: Buffer.from('# ' + repo.name + '\n').toString('base64')
-            }
-          })
-        }
-        initialized = true
-      }
-    }
-
-    // github picks the initial branch name itself, so rename it to whatever the config asked for
-    if (initialized && repo.defaultBranch) await renameInitialBranch(org, repo, dry)
-
-    done.initialized = true
-  }
+  await ensureRepo(org, repo, prev, dry, done)
 
   const settings = {}
   const prevSettings = {}
@@ -1196,7 +1152,7 @@ async function reconcile(org, repo, prev, dry, done, opts) {
     prevSettings[k] = prev[k]
   }
 
-  if (current && changed(settings, prevSettings)) {
+  if (changed(settings, prevSettings)) {
     await reconcileSettings(org, repo, dry, prev)
   }
   if (repo.description !== undefined) done.description = repo.description
@@ -1211,35 +1167,35 @@ async function reconcile(org, repo, prev, dry, done, opts) {
   if (typeof repo.template === 'boolean') done.template = repo.template
   if (repo.security) done.security = repo.security
 
-  if (repo.security && repo.security.codeScanningDefaultSetup !== undefined && current) {
+  if (repo.security && repo.security.codeScanningDefaultSetup !== undefined) {
     const prevCs = prev.security && prev.security.codeScanningDefaultSetup
     if (prevCs !== repo.security.codeScanningDefaultSetup) {
       await reconcileCodeScanning(org, repo.name, repo.security.codeScanningDefaultSetup, dry)
     }
   }
 
-  if (repo.actionsAccess !== undefined && current && repo.actionsAccess !== prev.actionsAccess) {
+  if (repo.actionsAccess !== undefined && repo.actionsAccess !== prev.actionsAccess) {
     await reconcileActionsAccess(org, repo.name, repo.actionsAccess, dry)
   }
   if (repo.actionsAccess !== undefined) done.actionsAccess = repo.actionsAccess
 
-  if (repo.forkPrContributorApproval !== undefined && current && repo.forkPrContributorApproval !== prev.forkPrContributorApproval) {
+  if (repo.forkPrContributorApproval !== undefined && repo.forkPrContributorApproval !== prev.forkPrContributorApproval) {
     await reconcileForkPrContributorApproval(org, repo.name, repo.forkPrContributorApproval, dry)
   }
   if (repo.forkPrContributorApproval !== undefined) done.forkPrContributorApproval = repo.forkPrContributorApproval
 
-  if (repo.topics && current && changed(repo.topics, prev.topics)) {
+  if (repo.topics && changed(repo.topics, prev.topics)) {
     await reconcileTopics(org, repo.name, repo.topics, dry)
   }
   if (repo.topics) done.topics = repo.topics
 
-  if (current && (repo.teams || prev.teams) && changed(repo.teams, prev.teams)) {
+  if ((repo.teams || prev.teams) && changed(repo.teams, prev.teams)) {
     done.teams = await reconcileTeams(org, repo.name, repo.teams || [], prev.teams, dry)
   } else {
     done.teams = repo.teams
   }
 
-  if (current && (repo.collaborators || prev.collaborators) && changed(repo.collaborators, prev.collaborators)) {
+  if ((repo.collaborators || prev.collaborators) && changed(repo.collaborators, prev.collaborators)) {
     done.collaborators = await reconcileCollaborators(org, repo.name, repo.collaborators || [], prev.collaborators, dry)
   } else {
     done.collaborators = repo.collaborators
@@ -1247,20 +1203,18 @@ async function reconcile(org, repo, prev, dry, done, opts) {
 
   if (changed(repo.branchProtection, prev.branchProtection)) {
     for (const rule of repo.branchProtection || []) {
-      if (current) await reconcileBranchProtection(org, repo.name, rule, dry)
+      await reconcileBranchProtection(org, repo.name, rule, dry)
     }
     const prevBranches = new Set((prev.branchProtection || []).map((r) => r.branch || 'main'))
     const desiredBranches = new Set((repo.branchProtection || []).map((r) => r.branch || 'main'))
     for (const branch of prevBranches) {
       if (desiredBranches.has(branch)) continue
-      if (current) {
-        print(dry, 'remove-branch-protection', `${org}/${repo.name}`, branch)
-        if (!dry) {
-          try {
-            await gh(['api', `repos/${org}/${repo.name}/branches/${branch}/protection`, '--method', 'DELETE'])
-          } catch (err) {
-            if (!/Branch not protected|Not Found/.test(err.message)) throw err
-          }
+      print(dry, 'remove-branch-protection', `${org}/${repo.name}`, branch)
+      if (!dry) {
+        try {
+          await gh(['api', `repos/${org}/${repo.name}/branches/${branch}/protection`, '--method', 'DELETE'])
+        } catch (err) {
+          if (!/Branch not protected|Not Found/.test(err.message)) throw err
         }
       }
     }
@@ -1275,13 +1229,13 @@ async function reconcile(org, repo, prev, dry, done, opts) {
       print(dry, 'skip-environments', `${org}/${repo.name}`, 'requires enterprise for private repos with reviewers')
     } else {
       for (const env of repo.environments || []) {
-        if (current) await reconcileEnvironment(org, repo.name, env, dry)
+        await reconcileEnvironment(org, repo.name, env, dry)
       }
       if (repo.environments) done.environments = repo.environments
     }
   }
 
-  if (current && (repo.rulesets || prev.rulesets) && changed(repo.rulesets, prev.rulesets)) {
+  if ((repo.rulesets || prev.rulesets) && changed(repo.rulesets, prev.rulesets)) {
     done.rulesets = await reconcileRulesets(org, repo.name, repo.rulesets || [], prev.rulesets, dry)
   } else {
     done.rulesets = repo.rulesets
@@ -1295,19 +1249,19 @@ async function reconcile(org, repo, prev, dry, done, opts) {
   }
   if (repo.pypi) done.pypi = repo.pypi
 
-  if (repo.githubPackages && changed(repo.githubPackages, prev.githubPackages) && current) {
+  if (repo.githubPackages && changed(repo.githubPackages, prev.githubPackages)) {
     await reconcileGithubPackages(org, repo.name, repo.githubPackages, dry)
   }
   if (repo.githubPackages) done.githubPackages = repo.githubPackages
 
   const configDir = opts.configPath ? path.dirname(opts.configPath) : null
 
-  if (repo.secrets && current) {
+  if (repo.secrets) {
     const next = await reconcileSecrets(org, repo.name, repo.secrets, prev.secrets, dry, null, configDir)
     if (next) done.secrets = next
   }
 
-  if (repo.environments && current) {
+  if (repo.environments) {
     const envSecrets = prev.envSecrets || {}
     const newEnvSecrets = {}
     for (const env of repo.environments) {
@@ -2987,6 +2941,52 @@ async function deleteRepo(org, name, dry) {
   } catch (err) {
     if (!/Not Found/.test(err.message)) throw err
     print(false, 'skip-delete', `${org}/${name}`, 'already gone')
+  }
+}
+
+async function ensureRepo(org, repo, prev, dry, done) {
+  const existing = Object.keys(prev).length > 0 || (await getRepo(org, repo.name))
+  if (!existing) {
+    print(dry, 'create', `${org}/${repo.name}`)
+    if (!dry) {
+      await createRepo(org, repo)
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+    }
+    // createRepo already sets description, homepage and visibility
+    if (repo.description !== undefined) prev.description = repo.description
+    if (repo.homepage !== undefined) prev.homepage = repo.homepage
+    if (repo.private !== undefined) prev.private = repo.private
+    if (repo.internal !== undefined) prev.internal = repo.internal
+    if (repo.init) done.initialized = true
+  }
+
+  if (repo.init && !prev.initialized) {
+    // the create path above sets this when gh repo create --add-readme made the initial commit
+    let initialized = done.initialized === true
+
+    if (!initialized) {
+      let branches = []
+      try {
+        branches = JSON.parse(await gh(['api', `repos/${org}/${repo.name}/branches`]))
+      } catch {}
+      if (branches.length === 0) {
+        print(dry, 'init-readme', `${org}/${repo.name}`)
+        if (!dry) {
+          await gh(['api', `repos/${org}/${repo.name}/contents/README.md`, '--method', 'PUT', '--input', '-'], {
+            body: {
+              message: 'Initial commit',
+              content: Buffer.from('# ' + repo.name + '\n').toString('base64')
+            }
+          })
+        }
+        initialized = true
+      }
+    }
+
+    // github picks the initial branch name itself, so rename it to whatever the config asked for
+    if (initialized && repo.defaultBranch) await renameInitialBranch(org, repo, dry)
+
+    done.initialized = true
   }
 }
 
