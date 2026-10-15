@@ -2945,7 +2945,11 @@ async function deleteRepo(org, name, dry) {
 }
 
 async function ensureRepo(org, repo, prev, dry, done) {
-  const existing = Object.keys(prev).length > 0 || (await getRepo(org, repo.name))
+  // state alone is no proof the repo exists, a failed apply saves partial
+  // progress (and a missing renamedFrom records itself) before anything was
+  // created. check GitHub once and record it so later applies skip the call
+  const existing = prev.exists === true || (await getRepo(org, repo.name))
+  done.exists = true
   if (!existing) {
     print(dry, 'create', `${org}/${repo.name}`)
     if (!dry) {

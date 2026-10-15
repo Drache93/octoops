@@ -941,7 +941,7 @@ const membersOnly = await importOrg('my-org', { only: ['members'] })
 seed(config, { statePath: './config.state.json' })
 ```
 
-A state file is written next to the config to track what was last applied. On partial failure, completed steps are saved so the next run picks up where it left off.
+A state file is written next to the config to track what was last applied. On partial failure, completed steps are saved so the next run picks up where it left off. A state entry alone is not taken as proof the repo exists on GitHub: the first apply that touches a repo checks and records `exists: true`, so a repo that was never created (for example after a failed first apply) is still created.
 
 ## Note
 
