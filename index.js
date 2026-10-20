@@ -1,5 +1,4 @@
 const { spawn } = require('child_process')
-const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -52,6 +51,14 @@ async function importOrg(org, opts = {}) {
     } catch {}
   }
 
+  if (!only || only.has('secrets')) {
+    console.log('fetching org secrets...')
+    try {
+      const orgSecrets = await importOrgSecrets(org)
+      if (Object.keys(orgSecrets).length) config.orgSecrets = orgSecrets
+    } catch {}
+  }
+
   if (!only || only.has('teams')) {
     console.log('fetching org teams...')
     const orgTeams = await importOrgTeams(org, opts.teams)
@@ -79,6 +86,25 @@ async function importOrg(org, opts = {}) {
   }
 
   return config
+}
+
+async function importOrgSecrets(org) {
+  const out = {}
+  const list = JSON.parse(await gh(['secret', 'list', '--org', org, '--json', 'name,visibility']))
+  for (const s of list) {
+    const entry = { visibility: s.visibility }
+    if (s.visibility === 'selected') entry.repos = await listOrgSecretRepos(org, s.name)
+    out[s.name] = entry
+  }
+  return out
+}
+
+async function listSecretNames(args) {
+  try {
+    return JSON.parse(await gh(['secret', 'list', ...args, '--json', 'name'])).map((s) => s.name).sort()
+  } catch {
+    return []
+  }
 }
 
 async function importOrgTeams(org, filterNames) {
@@ -220,10 +246,15 @@ async function importRepo(org, name) {
           .map((r) => ({ team: r.reviewer.name }))
         if (reviewers.length) e.reviewers = reviewers
         if (env.prevent_self_review) e.preventSelfReview = true
+        const envSecrets = await listSecretNames(['--repo', `${org}/${name}`, '--env', env.name])
+        if (envSecrets.length) e.secrets = envSecrets
         entry.environments.push(e)
       }
     }
   } catch {}
+
+  const secrets = await listSecretNames(['--repo', `${org}/${name}`])
+  if (secrets.length) entry.secrets = secrets
 
   try {
     const rulesets = JSON.parse(await gh(['api', `repos/${org}/${name}/rulesets`]))
@@ -397,9 +428,11 @@ function seed(config, opts = {}) {
     const key = config.org + '/' + repo.name
     const entry = {}
     const existing = state[key] || {}
-    if (existing.secrets) entry.secrets = existing.secrets
-    if (existing.envSecrets) entry.envSecrets = existing.envSecrets
     if (existing.npmTrust) entry.npmTrust = existing.npmTrust
+    if (repo.secrets) entry.secrets = normalizeSecretNames(repo.secrets)
+    const envSecrets = {}
+    for (const env of repo.environments || []) if (env.secrets) envSecrets[env.name] = normalizeSecretNames(env.secrets)
+    if (Object.keys(envSecrets).length) entry.envSecrets = envSecrets
     if (raw.renamedFrom) entry.renamedFrom = raw.renamedFrom
     if (repo.archived) entry.archived = true
     if (repo.description !== undefined) entry.description = repo.description
@@ -426,6 +459,8 @@ function seed(config, opts = {}) {
     if (repo.githubPackages) entry.githubPackages = repo.githubPackages
     state[key] = entry
   }
+
+  if (config.orgSecrets) state.orgSecrets = normalizeOrgSecrets(config.orgSecrets)
 
   if (opts.statePath) saveState(opts.statePath, state)
   console.log('seeded state for ' + (config.teams ? config.teams.length + ' teams and ' : '') + (config.repos || []).length + ' repos')
@@ -486,6 +521,7 @@ async function resync(config, opts = {}) {
     only.push('repos')
     importOpts.repos = repos.map((r) => r.name)
   }
+  if (config.orgSecrets) only.push('secrets')
   if (only.length) importOpts.only = only
 
   const fresh = await importOrg(config.org, importOpts)
@@ -498,6 +534,10 @@ async function resync(config, opts = {}) {
   if (config.teams && fresh.teams) {
     const keep = new Set(config.teams.map((t) => t.name))
     fresh.teams = fresh.teams.filter((t) => keep.has(t.name))
+  }
+
+  if (config.orgSecrets && fresh.orgSecrets) {
+    for (const name of Object.keys(fresh.orgSecrets)) if (!(name in config.orgSecrets)) delete fresh.orgSecrets[name]
   }
 
   // tombstones for repos still marked deleted survive the resync, GitHub has
@@ -520,6 +560,8 @@ async function resync(config, opts = {}) {
 async function apply(config, opts = {}) {
   const dry = opts.dry === true
   if (config.enterprise) opts = { ...opts, enterprise: true }
+  // values are prompted once per name per apply and reused across every target
+  opts = { ...opts, secretValues: new Map(), invalidate: new Set(opts.invalidate || []), invalidated: new Set() }
   validateConfig(config)
   const state = loadState(opts.statePath)
 
@@ -704,6 +746,24 @@ async function apply(config, opts = {}) {
           if (opts.statePath) saveState(opts.statePath, state)
         }
       }
+    }
+
+    // after repos — an org secret can select a repo created earlier in this apply
+    if (config.orgSecrets || state.orgSecrets) {
+      const desired = normalizeOrgSecrets(config.orgSecrets || {})
+      const prev = state.orgSecrets || {}
+      const needs = Object.keys(desired).some((n) => opts.invalidate.has(n))
+      if (needs || changed(desired, prev)) {
+        const applied = await reconcileOrgSecrets(config.org, desired, prev, dry, opts)
+        if (!dry) {
+          state.orgSecrets = applied
+          if (opts.statePath) saveState(opts.statePath, state)
+        }
+      }
+    }
+
+    for (const name of opts.invalidate) {
+      if (!opts.invalidated.has(name)) console.error('warning: --invalidate ' + name + ' matched no secret in this config')
     }
 
     // after repos — an app can reference a repo created earlier in this apply
@@ -925,8 +985,10 @@ const ROOT_KEYS = new Set([
   'presets', 'defaults',
   'repos', 'teams', 'admins', 'members',
   'security', 'runnerGroups', 'hostedRunners', 'pruneOfflineRunners',
-  'apps'
+  'apps', 'orgSecrets'
 ])
+
+const SECRET_VISIBILITY = new Set(['all', 'private', 'selected'])
 
 const REPO_KEYS = new Set([
   'name', 'description', 'homepage',
@@ -956,6 +1018,15 @@ function validateConfig(config) {
     if (raw.renamedFrom !== undefined && raw.renamedFrom === raw.name) {
       console.error('warning: "renamedFrom" on repo "' + raw.name + '" equals its name and is ignored')
     }
+    validateSecretNames(raw.secrets, 'repo "' + (raw.name || '?') + '"')
+    for (const env of raw.environments || []) validateSecretNames(env.secrets, 'environment "' + env.name + '" on repo "' + (raw.name || '?') + '"')
+  }
+  for (const name of Object.keys(config.orgSecrets || {})) {
+    const s = config.orgSecrets[name]
+    if (!s || typeof s !== 'object') throw new Error('orgSecrets "' + name + '" must be an object like { "visibility": "selected", "repos": [...] }')
+    if (s.visibility !== undefined && !SECRET_VISIBILITY.has(s.visibility)) throw new Error('orgSecrets "' + name + '" visibility must be one of all, private, selected')
+    if (s.visibility === 'selected' && !(Array.isArray(s.repos) && s.repos.length)) throw new Error('orgSecrets "' + name + '" with visibility "selected" needs a non-empty "repos" list')
+    if (s.visibility !== 'selected' && s.repos) console.error('warning: orgSecrets "' + name + '" lists repos but visibility is not "selected", ignored')
   }
   for (const name of Object.keys(config.defaults || {})) {
     const entry = config.defaults[name]
@@ -967,6 +1038,27 @@ function validateConfig(config) {
       if (!DEFAULTS_KEYS.has(k)) console.error('warning: unknown property "' + k + '" on defaults "' + name + '"' + suggest(k, DEFAULTS_KEYS, null))
     }
   }
+}
+
+function validateSecretNames(secrets, where) {
+  if (secrets === undefined) return
+  if (typeof secrets === 'string') throw new Error('secrets on ' + where + ' is a file path, it must now be a list of names like ["NPM_TOKEN"] (values are prompted for on apply)')
+  if (!Array.isArray(secrets) || secrets.some((s) => typeof s !== 'string' || !s)) throw new Error('secrets on ' + where + ' must be a list of names')
+}
+
+function normalizeSecretNames(names) {
+  return [...new Set(names)].sort()
+}
+
+function normalizeOrgSecrets(orgSecrets) {
+  const out = {}
+  for (const name of Object.keys(orgSecrets)) {
+    const s = orgSecrets[name]
+    const entry = { visibility: s.visibility || 'private' }
+    if (entry.visibility === 'selected') entry.repos = normalizeSecretNames(s.repos)
+    out[name] = entry
+  }
+  return out
 }
 
 function suggest(unknown, allowed, aliases) {
@@ -1075,7 +1167,12 @@ function changed(a, b) {
   return JSON.stringify(a) !== JSON.stringify(b)
 }
 
-function repoChanged(repo, prev) {
+function secretsChanged(names, prevNames, opts) {
+  if (changed(normalizeSecretNames(names), prevNames || [])) return true
+  return names.some((n) => opts.invalidate.has(n))
+}
+
+function repoChanged(repo, prev, opts) {
   if (repo.archived && !prev.archived) return true
   if (repo.archived) {
     // Archived repos are frozen on GitHub, but npm lives on the registry —
@@ -1104,14 +1201,14 @@ function repoChanged(repo, prev) {
   if ((repo.githubPackages || prev.githubPackages) && changed(repo.githubPackages, prev.githubPackages)) return true
   if (repo.actionsAccess !== undefined && repo.actionsAccess !== prev.actionsAccess) return true
   if (repo.forkPrContributorApproval !== undefined && repo.forkPrContributorApproval !== prev.forkPrContributorApproval) return true
-  if (repo.secrets) return true
-  if (repo.environments && repo.environments.some((e) => e.secrets)) return true
+  if (repo.secrets && secretsChanged(repo.secrets, prev.secrets, opts)) return true
+  if (repo.environments && repo.environments.some((e) => e.secrets && secretsChanged(e.secrets, (prev.envSecrets || {})[e.name], opts))) return true
   if (repo.init && !prev.initialized) return true
   return false
 }
 
 async function reconcile(org, repo, prev, dry, done, opts) {
-  if (!repoChanged(repo, prev)) return
+  if (!repoChanged(repo, prev, opts)) return
 
   if (repo.archived) {
     // npm/registry state is independent of GitHub's archive flag, so reconcile
@@ -1254,11 +1351,8 @@ async function reconcile(org, repo, prev, dry, done, opts) {
   }
   if (repo.githubPackages) done.githubPackages = repo.githubPackages
 
-  const configDir = opts.configPath ? path.dirname(opts.configPath) : null
-
   if (repo.secrets) {
-    const next = await reconcileSecrets(org, repo.name, repo.secrets, prev.secrets, dry, null, configDir)
-    if (next) done.secrets = next
+    done.secrets = await reconcileSecrets(org, repo.name, repo.secrets, prev.secrets, dry, null, opts)
   }
 
   if (repo.environments) {
@@ -1266,8 +1360,7 @@ async function reconcile(org, repo, prev, dry, done, opts) {
     const newEnvSecrets = {}
     for (const env of repo.environments) {
       if (!env.secrets) continue
-      const next = await reconcileSecrets(org, repo.name, env.secrets, envSecrets[env.name], dry, env.name, configDir)
-      if (next) newEnvSecrets[env.name] = next
+      newEnvSecrets[env.name] = await reconcileSecrets(org, repo.name, env.secrets, envSecrets[env.name], dry, env.name, opts)
     }
     if (Object.keys(newEnvSecrets).length) done.envSecrets = newEnvSecrets
   }
@@ -3063,48 +3156,176 @@ function randSalt() {
   return crypto.randomBytes(32).toString('hex')
 }
 
-async function reconcileSecrets(org, name, file, prevState, dry, envName, configDir) {
-  const filePath = path.resolve(configDir || '.', file)
-  if (!fs.existsSync(filePath)) {
-    print(dry, 'skip-secrets', `${org}/${name}`, (envName ? envName + ' ' : '') + 'file missing: ' + file)
-    return prevState || null
-  }
-  const desired = parseSecretsFile(filePath)
-  const prev = prevState || {}
-  const newState = {}
+// state holds secret names only, never anything derived from a value. a name
+// is set when it is missing from state or named by --invalidate, and the value
+// is prompted for once per apply and reused for every target declaring it
+async function reconcileSecrets(org, name, names, prevNames, dry, envName, opts) {
+  const desired = normalizeSecretNames(names)
+  const prev = prevNames || []
+  const target = `${org}/${name}`
+  const label = (envName ? envName + '/' : '')
+  const next = []
 
-  for (const key of Object.keys(desired)) {
-    const value = desired[key]
-    const prevEntry = prev[key]
-    if (Array.isArray(prevEntry) && prevEntry.length === 2 && hashSecret(prevEntry[0], value) === prevEntry[1]) {
-      newState[key] = prevEntry
+  for (const key of desired) {
+    if (prev.includes(key) && !opts.invalidate.has(key)) {
+      next.push(key)
       continue
     }
-    print(dry, 'set-secret', `${org}/${name}`, (envName ? envName + '/' : '') + key)
+    const value = await secretValue(key, dry, opts)
+    if (value === null) {
+      print(dry, 'skip-secret', target, label + key + ' needs a value, no tty')
+      if (prev.includes(key)) next.push(key)
+      continue
+    }
+    print(dry, 'set-secret', target, label + key)
     if (!dry) {
-      const args = ['secret', 'set', key, '--repo', `${org}/${name}`]
+      const args = ['secret', 'set', key, '--repo', target]
       if (envName) args.push('--env', envName)
       await gh(args, { rawBody: value })
     }
-    const salt = randSalt()
-    newState[key] = [salt, hashSecret(salt, value)]
+    next.push(key)
   }
 
-  for (const key of Object.keys(prev)) {
-    if (key in desired) continue
-    print(dry, 'remove-secret', `${org}/${name}`, (envName ? envName + '/' : '') + key)
+  for (const key of prev) {
+    if (desired.includes(key)) continue
+    print(dry, 'remove-secret', target, label + key)
     if (!dry) {
-      const args = ['secret', 'delete', key, '--repo', `${org}/${name}`]
+      const args = ['secret', 'delete', key, '--repo', target]
       if (envName) args.push('--env', envName)
-      try {
-        await gh(args)
-      } catch (err) {
-        if (!/Not Found/.test(err.message)) throw err
-      }
+      await ghIgnoreNotFound(args)
     }
   }
 
-  return newState
+  return next
+}
+
+async function reconcileOrgSecrets(org, desired, prev, dry, opts) {
+  const applied = {}
+
+  for (const name of Object.keys(desired)) {
+    const want = desired[name]
+    const had = prev[name]
+    // github only lets visibility change together with a value, so that prompts too
+    const needsValue = !had || opts.invalidate.has(name) || had.visibility !== want.visibility
+
+    if (needsValue) {
+      const value = await secretValue(name, dry, opts)
+      if (value === null) {
+        print(dry, 'skip-secret', org, name + ' needs a value, no tty')
+        if (had) applied[name] = had
+        continue
+      }
+      print(dry, 'set-org-secret', org, name + ' ' + want.visibility + (want.repos ? ' ' + want.repos.join(',') : ''))
+      if (!dry) {
+        const args = ['secret', 'set', name, '--org', org, '--visibility', want.visibility]
+        if (want.repos) args.push('--repos', want.repos.join(','))
+        await gh(args, { rawBody: value })
+      }
+    } else if (changed(want.repos, had.repos)) {
+      print(dry, 'org-secret-repos', org, name + ' ' + want.repos.join(','))
+      if (!dry) {
+        const ids = []
+        for (const repoName of want.repos) ids.push(JSON.parse(await gh(['api', `repos/${org}/${repoName}`])).id)
+        await gh(['api', `orgs/${org}/actions/secrets/${name}/repositories`, '--method', 'PUT', '--input', '-'], {
+          body: { selected_repository_ids: ids }
+        })
+      }
+    }
+    applied[name] = want
+  }
+
+  for (const name of Object.keys(prev)) {
+    if (name in desired) continue
+    print(dry, 'remove-org-secret', org, name)
+    if (!dry) await ghIgnoreNotFound(['secret', 'delete', name, '--org', org])
+  }
+
+  return applied
+}
+
+async function listOrgSecretRepos(org, name) {
+  const pages = JSON.parse(await gh(['api', `orgs/${org}/actions/secrets/${name}/repositories`, '--paginate', '--slurp']))
+  return pages.flatMap((p) => p.repositories).map((r) => r.name).sort()
+}
+
+async function ghIgnoreNotFound(args) {
+  try {
+    await gh(args)
+  } catch (err) {
+    if (!/Not Found/.test(err.message)) throw err
+  }
+}
+
+// null means there is nobody to ask. dry runs never prompt, they report the
+// prompt that a real apply would make
+async function secretValue(name, dry, opts) {
+  opts.invalidated.add(name)
+  if (opts.secretValues.has(name)) return opts.secretValues.get(name)
+  let value
+  if (dry) {
+    print(dry, 'prompt-secret', name)
+    value = ''
+  } else if (!process.stdin.isTTY) {
+    return null
+  } else {
+    do value = await readSecret(name)
+    while (!value)
+    console.log(name + ': ' + value.length + ' chars')
+  }
+  opts.secretValues.set(name, value)
+  return value
+}
+
+// hidden prompt on the tty. enter or ctrl-d submits, ctrl-c aborts. bracketed
+// paste is enabled so newlines inside a paste are data rather than enter
+const PASTE_START = '\x1b[200~'
+const PASTE_END = '\x1b[201~'
+
+function readSecret(name) {
+  return new Promise((resolve, reject) => {
+    const stdin = process.stdin
+    const out = process.stdout
+    let buf = ''
+    let pending = ''
+    let pasting = false
+
+    out.write(name + ': ')
+    out.write('\x1b[?2004h')
+    stdin.setRawMode(true)
+    stdin.setEncoding('utf8')
+    stdin.resume()
+
+    const finish = (err) => {
+      stdin.removeListener('data', onData)
+      stdin.setRawMode(false)
+      stdin.pause()
+      out.write('\x1b[?2004l\n')
+      if (err) reject(err)
+      else resolve(buf.replace(/\r\n?/g, '\n').replace(/\n$/, ''))
+    }
+
+    const onData = (chunk) => {
+      chunk = pending + chunk
+      pending = ''
+      let i = 0
+      while (i < chunk.length) {
+        const rest = chunk.slice(i, i + PASTE_START.length)
+        if (rest === PASTE_START) { pasting = true; i += rest.length; continue }
+        if (rest === PASTE_END) { pasting = false; i += rest.length; continue }
+        // a paste marker split across two chunks, wait for the rest
+        if (rest.length < PASTE_START.length && (PASTE_START.startsWith(rest) || PASTE_END.startsWith(rest))) { pending = rest; break }
+        const c = chunk[i++]
+        if (pasting) { buf += c; continue }
+        if (c === '\x03') return finish(new Error('aborted'))
+        if (c === '\x04' || c === '\r' || c === '\n') return finish()
+        if (c === '\x7f' || c === '\b') { buf = buf.slice(0, -1); continue }
+        if (c === '\x1b') continue
+        buf += c
+      }
+    }
+
+    stdin.on('data', onData)
+  })
 }
 
 function slugify(name) {

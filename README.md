@@ -23,6 +23,7 @@ octoops import my-org > config.json
 octoops import my-org -o config.json
 octoops import my-org --only members
 octoops import my-org --only members,teams
+octoops import my-org --only secrets
 ```
 
 Seed state from an existing config (skips GitHub API calls):
@@ -479,7 +480,7 @@ Each entry in `environments` supports:
 - `name` — required
 - `reviewers: [{ team }]` — required-reviewer teams (deployments are gated until one approves). On private repos this requires GitHub Enterprise; otherwise octoops prints `skip-environments` unless `enterprise: true` is set
 - `preventSelfReview: true` — block the actor who triggered a deployment from approving it themselves
-- `secrets` — see "Secrets" below
+- `secrets` — list of secret names, see "Secrets" below
 
 ```json
 "environments": [
@@ -489,34 +490,50 @@ Each entry in `environments` supports:
 
 ### Secrets
 
-Reference a local dotenv-style file from a repo or environment:
+Declare the names of the Actions secrets a repo or environment should have. Values are never stored in config or state: apply prompts for them on the terminal.
 
 ```json
 {
   "name": "my-repo",
-  "secrets": ".secrets",
+  "secrets": ["NPM_TOKEN", "SLACK_WEBHOOK"],
   "environments": [
-    { "name": "production", "secrets": ".secrets.prod" }
+    { "name": "production", "secrets": ["NPM_TOKEN"] }
   ]
 }
 ```
 
-File format (`KEY=value`, `#` comments, optional quoting):
-
-```
-NPM_TOKEN=abc123
-SLACK_WEBHOOK="https://hooks.slack.com/..."
-# tokens
-GH_TOKEN='ghp_...'
-```
-
 Behavior:
 
-- Paths resolve relative to the config file
-- Missing file → octoops prints `skip-secrets` and leaves existing secrets/state alone (so you can `.gitignore` the secrets file and only run apply where it's present)
-- Each secret is hashed with a per-secret HMAC-SHA256 salt (`[salt, hmac]`); state never holds plaintext, and hashes can't be correlated across secrets/repos/state files
-- Only secrets whose value changed are PUT to GitHub; secrets removed from the file are deleted from GitHub
-- Values are sent to `gh secret set` over stdin (never on the command line, never logged)
+- State records which names have been set. A declared name missing from state is prompted for and set with `gh secret set` (value over stdin, never on the command line, never logged). Names removed from the config are deleted from GitHub
+- A value is prompted for **once per name per apply** and used for every repo, environment and org secret in that config that declares it. Two repos that need different values need different names
+- `octoops apply --invalidate NPM_TOKEN,SLACK_WEBHOOK config.json` prompts for those names again and sets them everywhere they are declared. That is how you rotate a secret. A name that matches nothing prints a warning
+- The prompt hides what you type. Paste works, including multiline values like PEM keys: bracketed paste is enabled so newlines inside a paste are data. Enter or Ctrl-D submits, Ctrl-C aborts the apply (secrets already set in that run stay recorded). On a terminal without bracketed paste a multiline paste stops at its first newline, so submit it with Ctrl-D instead. An empty value is re-prompted
+- When stdin is not a terminal (CI, `apply.sh | tee`), octoops prints `skip-secret` for any name that needs a value and leaves it for an interactive run. Deletes still happen, they need no value
+- Dry runs never prompt. They print `prompt-secret NAME` once and `set-secret` per target
+- `import` and `resync` read secret names from GitHub, so state can be rebuilt. A secret deleted by hand disappears from state on resync and is prompted for again on the next apply
+- A repo entry without `secrets` leaves that repo's secrets alone. An empty list deletes every secret state knows about
+
+### Org secrets
+
+Org-level Actions secrets and which repos can read them. Visibility is `all`, `private` (private and internal repos) or `selected`, which takes a `repos` list.
+
+```json
+{
+  "org": "my-org",
+  "orgSecrets": {
+    "NPM_TOKEN": { "visibility": "selected", "repos": ["api", "web"] },
+    "SLACK_WEBHOOK": { "visibility": "private" },
+    "CODECOV_TOKEN": { "visibility": "all" }
+  }
+}
+```
+
+- Values are prompted for exactly like repo secrets, and share the once-per-name cache with them, so an org secret and a repo secret with the same name get the same value in one apply
+- Changing only the `repos` list updates access without a prompt. Changing `visibility` prompts for the value again, GitHub only accepts visibility together with a value
+- The `repos` list is authoritative: repos dropped from it lose access. Names are resolved to ids after the repos in the config have been reconciled, so an org secret can select a repo created in the same apply
+- Removing a name from `orgSecrets` deletes the secret. Secrets not listed are left alone
+- An org secret's repo list is one global thing, so keep `orgSecrets` in exactly one config. If two configs declare the same name, the last apply wins
+- Org secrets cannot be scoped to an environment. For that, declare the name under `environments[].secrets` on each repo
 
 ### Ruleset fields
 

@@ -11,6 +11,7 @@ const applyCmd = command(
   flag('--audit', 'Write an audit log to audits/<timestamp>.log'),
   flag('--enterprise', 'Enable enterprise features (env reviewers on private repos)'),
   flag('--no-renew', 'Do not recreate expired npm trusted publishers'),
+  flag('--invalidate [names]', 'Comma-separated secret names to prompt for and set again'),
   arg('<config>', 'Path to config JSON file or manifest with "includes"'),
   async function () {
     const root = path.resolve(applyCmd.args.config)
@@ -26,7 +27,8 @@ const applyCmd = command(
         configPath,
         audit: applyCmd.flags.audit,
         enterprise: applyCmd.flags.enterprise,
-        renew: applyCmd.flags.renew
+        renew: applyCmd.flags.renew,
+        invalidate: applyCmd.flags.invalidate ? applyCmd.flags.invalidate.split(',') : []
       })
     }
   }
@@ -37,7 +39,7 @@ const importCmd = command(
   summary('Import existing org config to JSON'),
   arg('<org>', 'GitHub org to import'),
   flag('--output|-o [path]', 'Output file path (default: stdout)'),
-  flag('--only [sections]', 'Comma-separated sections to import (members,teams,repos)'),
+  flag('--only [sections]', 'Comma-separated sections to import (members,teams,secrets,repos)'),
   flag('--repos [file]', 'Path to file with newline-separated repo names to import'),
   async function () {
     const opts = {}
