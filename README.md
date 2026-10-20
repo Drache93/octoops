@@ -481,11 +481,13 @@ Each entry in `environments` supports:
 - `name` — required
 - `reviewers: [{ team }]` — required-reviewer teams (deployments are gated until one approves). On private repos this requires GitHub Enterprise; otherwise octoops prints `skip-environments` unless `enterprise: true` is set
 - `preventSelfReview: true` — block the actor who triggered a deployment from approving it themselves
+- `deploymentBranches` — which refs may deploy to the environment. Omitted means any branch. `"protected"` limits it to protected branches. A list limits it to the given name patterns: a string or `{ "branch": "release/*" }` matches branches, `{ "tag": "v*" }` matches tags. Patterns use GitHub's branch-policy syntax (`*` and `**`). The list is reconciled, so a pattern removed from config is deleted on GitHub
 - `secrets` — list of secret names, see "Secrets" below
 
 ```json
 "environments": [
-  { "name": "npm", "reviewers": [{ "team": "release" }], "preventSelfReview": true }
+  { "name": "npm", "reviewers": [{ "team": "release" }], "preventSelfReview": true, "deploymentBranches": ["main", { "tag": "v*" }] },
+  { "name": "staging", "deploymentBranches": "protected" }
 ]
 ```
 

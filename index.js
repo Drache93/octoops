@@ -246,6 +246,12 @@ async function importRepo(org, name) {
           .map((r) => ({ team: r.reviewer.name }))
         if (reviewers.length) e.reviewers = reviewers
         if (env.prevent_self_review) e.preventSelfReview = true
+        const policy = env.deployment_branch_policy
+        if (policy && policy.protected_branches) e.deploymentBranches = 'protected'
+        else if (policy && policy.custom_branch_policies) {
+          const patterns = await getDeploymentBranchPolicies(org, name, env.name)
+          e.deploymentBranches = patterns.map((p) => (p.type === 'tag' ? { tag: p.name } : p.name))
+        }
         const envSecrets = await listSecretNames(['--repo', `${org}/${name}`, '--env', env.name])
         if (envSecrets.length) e.secrets = envSecrets
         entry.environments.push(e)
@@ -1030,7 +1036,15 @@ function validateConfig(config) {
       console.error('warning: "renamedFrom" on repo "' + raw.name + '" equals its name and is ignored')
     }
     validateSecretNames(raw.secrets, 'repo "' + (raw.name || '?') + '"')
-    for (const env of raw.environments || []) validateSecretNames(env.secrets, 'environment "' + env.name + '" on repo "' + (raw.name || '?') + '"')
+    for (const env of raw.environments || []) {
+      const where = 'environment "' + env.name + '" on repo "' + (raw.name || '?') + '"'
+      validateSecretNames(env.secrets, where)
+      try {
+        deploymentPolicy(env.deploymentBranches)
+      } catch (err) {
+        throw new Error(err.message + ' on ' + where)
+      }
+    }
   }
   for (const name of Object.keys(config.orgSecrets || {})) {
     const s = config.orgSecrets[name]
@@ -2185,11 +2199,34 @@ async function reconcileBranchProtection(org, name, rule, dry) {
     )
 }
 
+// deploymentBranches on an environment. Omitted means any branch may deploy,
+// "protected" limits it to protected branches, a list limits it to the given
+// branch name patterns (a string or { branch }) and { tag } patterns.
+function deploymentPolicy(value) {
+  if (value === undefined || value === null) return { policy: null, patterns: null }
+  if (value === 'protected') return { policy: { protected_branches: true, custom_branch_policies: false }, patterns: null }
+  if (!Array.isArray(value)) throw new Error('deploymentBranches must be "protected" or a list of patterns')
+  const patterns = value.map((p) => {
+    if (typeof p === 'string') return { name: p, type: 'branch' }
+    if (p && typeof p.branch === 'string') return { name: p.branch, type: 'branch' }
+    if (p && typeof p.tag === 'string') return { name: p.tag, type: 'tag' }
+    throw new Error('deploymentBranches entries must be a string, { "branch": "..." } or { "tag": "..." }')
+  })
+  return { policy: { protected_branches: false, custom_branch_policies: true }, patterns }
+}
+
+function patternKey(p) {
+  return (p.type || 'branch') + ':' + p.name
+}
+
 async function reconcileEnvironment(org, repoName, env, dry) {
   const current = await getEnvironment(org, repoName, env.name)
 
   const desiredReviewerSlugs = (env.reviewers || []).map((r) => slugify(r.team))
   const desiredPreventSelfReview = env.preventSelfReview === true
+  const { policy, patterns } = deploymentPolicy(env.deploymentBranches)
+  const desiredKeys = patterns ? patterns.map(patternKey).sort() : null
+  let currentPatterns = null
 
   if (current) {
     const currentSlugs = (current.protection_rules || [])
@@ -2199,18 +2236,35 @@ async function reconcileEnvironment(org, repoName, env, dry) {
       .sort()
 
     const currentPreventSelfReview = current.prevent_self_review === true
+    const currentPolicy = current.deployment_branch_policy
+      ? {
+          protected_branches: current.deployment_branch_policy.protected_branches === true,
+          custom_branch_policies: current.deployment_branch_policy.custom_branch_policies === true
+        }
+      : null
+
+    if (patterns && currentPolicy && currentPolicy.custom_branch_policies) {
+      currentPatterns = await getDeploymentBranchPolicies(org, repoName, env.name)
+    }
+    const currentKeys = currentPatterns ? currentPatterns.map(patternKey).sort() : null
 
     if (
       JSON.stringify(currentSlugs) === JSON.stringify([...desiredReviewerSlugs].sort()) &&
-      currentPreventSelfReview === desiredPreventSelfReview
+      currentPreventSelfReview === desiredPreventSelfReview &&
+      !changed(currentPolicy, policy) &&
+      !changed(currentKeys, desiredKeys)
     ) return
   }
+
+  const branches = patterns
+    ? patterns.map((p) => (p.type === 'tag' ? 'tag:' + p.name : p.name)).join(',')
+    : policy ? 'protected' : 'all'
 
   print(
     dry,
     'environment',
     `${org}/${repoName}`,
-    `${env.name} reviewers=${desiredReviewerSlugs.join(',')} preventSelfReview=${desiredPreventSelfReview}`
+    `${env.name} reviewers=${desiredReviewerSlugs.join(',')} preventSelfReview=${desiredPreventSelfReview} branches=${branches}`
   )
   if (dry) return
 
@@ -2223,9 +2277,24 @@ async function reconcileEnvironment(org, repoName, env, dry) {
   await gh(
     ['api', `repos/${org}/${repoName}/environments/${env.name}`, '--method', 'PUT', '--input', '-'],
     {
-      body: { reviewers, prevent_self_review: desiredPreventSelfReview }
+      body: { reviewers, prevent_self_review: desiredPreventSelfReview, deployment_branch_policy: policy }
     }
   )
+
+  if (!patterns) return
+
+  // custom policies can only be listed and created once the PUT above enabled them
+  const existing = currentPatterns || (await getDeploymentBranchPolicies(org, repoName, env.name))
+  const have = new Set(existing.map(patternKey))
+  const want = new Set(desiredKeys)
+  const base = `repos/${org}/${repoName}/environments/${env.name}/deployment-branch-policies`
+
+  for (const p of existing) {
+    if (!want.has(patternKey(p))) await gh(['api', `${base}/${p.id}`, '--method', 'DELETE'])
+  }
+  for (const p of patterns) {
+    if (!have.has(patternKey(p))) await gh(['api', base, '--method', 'POST', '--input', '-'], { body: { name: p.name, type: p.type } })
+  }
 }
 
 async function reconcileRulesets(org, repoName, desired, prev, dry) {
@@ -2536,6 +2605,11 @@ async function getEnvironment(org, name, env) {
   } catch {
     return null
   }
+}
+
+async function getDeploymentBranchPolicies(org, name, env) {
+  const res = JSON.parse(await gh(['api', `repos/${org}/${name}/environments/${env}/deployment-branch-policies?per_page=100`]))
+  return res.branch_policies || []
 }
 
 async function ensureNpmPackage(pkg, dry) {
