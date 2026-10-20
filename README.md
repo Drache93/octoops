@@ -163,6 +163,7 @@ A repo entry can also carry its own `presets` map. Those presets are only visibl
 ```
 
 - A local preset shadows a root preset of the same name, so `$reviewers` is `api-owners` inside `api` and `release` everywhere else
+- Scoping is dynamic: the shadow also applies to refs reached *through* a root preset or a `defaults` entry. If a shared `code-review` ruleset reads `$review`, a repo that sets `"presets": { "review": "data-structures" }` gets that team in the ruleset without restating the ruleset, whether it lists `"$code-review"` itself or inherits it via `defaults`. Every ref that resolves to `review` inside that repo switches, so check what else in the shared presets reads it
 - Local presets can reference root presets and other local presets, and the same spread and fan-out rules apply. Cycles are an error
 - Other repos and the root config cannot see a repo's local presets — referencing one from elsewhere is an unknown-preset error
 - Local presets work even when the config has no root `presets` map
@@ -280,7 +281,7 @@ Resolution rules:
 - Arrays and scalars replace.
 - Repo fields override the resolved defaults.
 - Cycles or unknown names are an error.
-- `$refs` inside a defaults entry are already resolved by the time it is merged, and old-style bare-string presets still resolve after the merge (so `rulesets: "default-rules"` keeps working too).
+- `$refs` inside a defaults entry are resolved in the repo's scope before the merge, so a repo's local presets apply to them. Old-style bare-string presets still resolve after the merge (so `rulesets: "default-rules"` keeps working too).
 
 Example with mixin composition:
 

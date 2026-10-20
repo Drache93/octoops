@@ -814,12 +814,19 @@ const FANOUT_KEYS = new Set(['team', 'username', 'app'])
 // A repo entry can carry its own `presets` map. Those are only visible inside
 // that entry, shadow the root presets of the same name, and may reference
 // root presets. The map is stripped from the entry once expanded.
+//
+// Scoping is dynamic: a ref is resolved against the scope it is *reached*
+// from, not the one its preset was declared in. So a shared ruleset preset
+// that reads $review picks up a repo's local review override, including when
+// it arrives through a defaults entry. That is why defaults are merged here,
+// in the repo's scope, rather than after expansion.
 function expandPresets(config) {
   const repos = Array.isArray(config.repos) ? config.repos : null
   const hasLocal = repos !== null && repos.some((r) => r && typeof r === 'object' && r.presets)
   if (!config.presets && !hasLocal) return config
 
   const root = createScope(config.presets || {}, null, 'presets')
+  const defaults = expand(config.defaults, 'defaults', root, new Set())
   const out = {}
 
   for (const key of Object.keys(config)) {
@@ -827,6 +834,8 @@ function expandPresets(config) {
       const map = {}
       for (const name of Object.keys(root.presets)) map[name] = lookup(name, root, new Set())
       out.presets = map
+    } else if (key === 'defaults') {
+      out.defaults = defaults
     } else if (key === 'repos' && repos) {
       out.repos = repos.map((raw, i) => expandRepo(raw, 'repos[' + i + ']'))
     } else {
@@ -841,10 +850,11 @@ function expandPresets(config) {
   }
 
   function expandRepo(raw, at) {
-    if (!raw || typeof raw !== 'object' || !raw.presets) return expand(raw, at, root, new Set())
+    if (!raw || typeof raw !== 'object') return expand(raw, at, root, new Set())
+    if (!raw.presets) return resolveDefaults(expand(raw, at, root, new Set()), defaults)
     const local = createScope(raw.presets, root, at + '.presets')
     const { presets, ...rest } = raw
-    return expand(rest, at, local, new Set())
+    return resolveDefaults(expand(rest, at, local, new Set()), expand(config.defaults, 'defaults', local, new Set()))
   }
 
   function has(name, scope) {
@@ -859,13 +869,14 @@ function expandPresets(config) {
   }
 
   function lookup(name, scope, seen) {
-    while (!(name in scope.presets)) scope = scope.parent
     if (scope.cache.has(name)) return scope.cache.get(name)
-    const at = scope.at + '.' + name
+    let owner = scope
+    while (!(name in owner.presets)) owner = owner.parent
+    const at = owner.at + '.' + name
     if (seen.has(at)) throw new Error('preset cycle at "' + name + '"')
     const path = new Set(seen)
     path.add(at)
-    const value = expand(scope.presets[name], at, scope, path)
+    const value = expand(owner.presets[name], at, scope, path)
     scope.cache.set(name, value)
     return value
   }
