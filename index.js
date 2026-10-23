@@ -3135,11 +3135,14 @@ async function ensureRepo(org, repo, prev, dry, done) {
   // progress (and a missing renamedFrom records itself) before anything was
   // created. check GitHub once and record it so later applies skip the call
   const existing = prev.exists === true || (await getRepo(org, repo.name))
-  done.exists = true
+  if (existing) done.exists = true
   if (!existing) {
     print(dry, 'create', `${org}/${repo.name}`)
     if (!dry) {
       await createRepo(org, repo)
+      // only now is the repo really there, recording it earlier would make a
+      // failed create look like a success on the next apply
+      done.exists = true
       await new Promise((resolve) => setTimeout(resolve, 2000))
     }
     // createRepo already sets description, homepage and visibility
