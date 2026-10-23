@@ -2765,9 +2765,9 @@ async function syncTrustedPublishers(pkg, repository, desired, renew) {
 // npm expires a trusted publisher that has not published within two days of
 // being created. we cannot see that clock, so state keeps our own: when octoops
 // last created the publishers for a package, and whether the registry has seen
-// a provenance publish since (which only the publisher can produce). confirmed
+// a trusted publish since (which only the publisher can produce). confirmed
 // packages are never looked at again. unconfirmed ones are left alone until our
-// clock says npm's has run out, then the registry decides: a provenance publish
+// clock says npm's has run out, then the registry decides: a trusted publish
 // confirms them, otherwise the publishers are recreated. so a package costs at
 // most one registry read per window, and a steady-state apply costs none
 const NPM_TRUST_RENEW_AFTER = 40 * 60 * 60 * 1000
@@ -2816,21 +2816,21 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
   }
 
   // first sight of this package, state predates the tracking or was seeded.
-  // any provenance publish proves the publisher works, otherwise the clock
+  // any trusted publish proves the publisher works, otherwise the clock
   // starts now since nothing can say when npm's did
   if (!setAt) {
-    if (hasProvenanceSince(packument, 0)) {
-      print(dry, 'npm-trust-confirmed', pkg, 'provenance publish found')
+    if (hasTrustedPublishSince(packument, 0)) {
+      print(dry, 'npm-trust-confirmed', pkg, 'trusted publish found')
       trust[pkg] = { confirmed: true }
     } else {
-      print(dry, 'npm-trust-track', pkg, 'no provenance publish yet')
+      print(dry, 'npm-trust-track', pkg, 'no trusted publish yet')
       trust[pkg] = { setAt: new Date().toISOString(), confirmed: false }
     }
     return
   }
 
-  if (hasProvenanceSince(packument, setAt - NPM_TRUST_CLOCK_SLACK)) {
-    print(dry, 'npm-trust-confirmed', pkg, 'provenance publish after ' + entry.setAt)
+  if (hasTrustedPublishSince(packument, setAt - NPM_TRUST_CLOCK_SLACK)) {
+    print(dry, 'npm-trust-confirmed', pkg, 'trusted publish after ' + entry.setAt)
     trust[pkg] = { confirmed: true }
     return
   }
@@ -2840,7 +2840,7 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
     return
   }
 
-  print(dry, 'npm-trust-renew', pkg, 'no provenance publish since ' + entry.setAt)
+  print(dry, 'npm-trust-renew', pkg, 'no trusted publish since ' + entry.setAt)
   if (dry) return
 
   await syncTrustedPublishers(pkg, repository, desired, true)
@@ -2858,17 +2858,25 @@ async function fetchPackument(pkg) {
   return res.json()
 }
 
-// a version published through a trusted publisher carries a provenance
-// attestation. a token publish can add one too with --provenance, close enough
-function hasProvenanceSince(packument, since) {
+// the registry marks a version published through a trusted publisher on its
+// _npmUser. a provenance attestation only shows up when the workflow asked for
+// it, so it is a fallback rather than the signal, but a token publish with
+// --provenance proves the same thing closely enough
+function hasTrustedPublishSince(packument, since) {
   if (!packument) return false
   const time = packument.time || {}
   for (const [version, data] of Object.entries(packument.versions || {})) {
-    const att = data.dist && data.dist.attestations
-    if (!att || !att.provenance) continue
+    if (!isTrustedPublish(data)) continue
     if (Date.parse(time[version]) >= since) return true
   }
   return false
+}
+
+function isTrustedPublish(data) {
+  const user = data._npmUser
+  if (user && user.trustedPublisher) return true
+  const att = data.dist && data.dist.attestations
+  return !!(att && att.provenance)
 }
 
 // npm prints one object per publisher, concatenated — never a JSON array — so
