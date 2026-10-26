@@ -839,7 +839,7 @@ A single package can also be published by more than one workflow — `trustedPub
 }
 ```
 
-Don't mix the two up: `npm` as an array means several packages from one repo, `trustedPublishing` as an array means several workflows publishing one package. A bare object is shorthand for a one-element list, so existing configs keep working untouched. npm allows up to 10 publishers per package.
+Don't mix the two up: `npm` as an array means several packages from one repo, `trustedPublishing` as an array means several workflows publishing one package. A bare object is shorthand for a one-element list, so existing configs keep working untouched. npm allows up to 10 publishers per package. Each package in the list is diffed against state on its own, so editing or adding one entry only touches that package; the others are not listed, re-authenticated or re-reconciled.
 
 Publishers reconcile as a set keyed on `(repository, workflow, environment)`. Declared but missing gets added (`npm-trust`), present but undeclared gets revoked (`npm-untrust`), and anything already matching is left alone. A missing `environment` counts as none on both sides, so `undefined`, `null` and `""` never churn. Adds run before revokes, so an interrupted apply leaves a package with too many publishers rather than none. Duplicate entries are collapsed before planning.
 
@@ -853,24 +853,27 @@ Needs npm **11.15.0 or newer**. Earlier versions have no `--allow-publish` flag 
 
 #### Expiry and renewal
 
-npm deletes a trusted publisher that hasn't published anything within two days of being created. Since octoops usually sets publishers up well before the first release, it tracks this itself. State keeps an `npmTrust` map per repo, keyed on package name:
+npm deletes a trusted publisher that hasn't published anything within two days of being created. Since octoops usually sets publishers up well before the first release, it tracks this itself, per publisher. State keeps an `npmTrust` map per repo, keyed on package name, with one entry per publisher npm lists for it:
 
 ```json
 "npmTrust": {
-  "my-module": { "setAt": "2026-10-12T09:00:00.000Z", "confirmed": false }
+  "my-module": [
+    { "id": "d99e4715-…", "file": "publish.yml", "environment": "npm", "setAt": "2026-10-12T09:00:00.000Z", "confirmed": false }
+  ]
 }
 ```
 
-`setAt` is written whenever an apply creates a publisher. Until it is 40 hours old nothing happens and nothing is fetched. After that, every apply (whether or not the `npm` block changed) gives the package one unauthenticated read of the public registry:
+`id` is what npm assigned the publisher, learned by listing again after an apply creates one. `setAt` is written when a publisher is created. Until it is 40 hours old nothing happens and nothing is fetched. After that, every apply (whether or not the `npm` block changed) gives the package one unauthenticated read of the public registry:
 
-- A version with a provenance attestation published after `setAt` means the publisher has been used. The package is marked `confirmed` (`npm-trust-confirmed`) and never checked again.
-- Otherwise the publishers are revoked and recreated (`npm-trust-renew`, then the usual `npm-untrust`/`npm-trust` lines) and `setAt` starts over. This needs an npm login like any other publisher change. Pass `--no-renew` to only report (`npm-trust-expired`) without touching npm; the package is then checked again on the next apply.
+- Every version published through a trusted publisher names the publisher config that let it in. A version carrying this publisher's `id` published after `setAt` means it has been used. It is marked `confirmed` (`npm-trust-confirmed`) and never checked again. A package with a single publisher skips the id match: any trusted publish is its own.
+- Otherwise that publisher alone is revoked and recreated (`npm-trust-renew`, then `npm-untrust`/`npm-trust` for just that one) and its `setAt` starts over. Siblings keep their ids and clocks. This needs an npm login like any other publisher change. Pass `--no-renew` to only report (`npm-trust-expired`) without touching npm; the publisher is then checked again on the next apply.
+- A trusted publish since the clock started that matches none of the package's ids is reported as `npm-trust-unmatched` before renewing, so a publisher from another repo or provider publishing here does not pass unnoticed.
 
 So a steady-state apply makes no registry requests at all, and a package costs at most one per window.
 
-Packages seen for the first time without a `setAt`, such as state from before this feature or a fresh `seed`/`resync`, are confirmed if any version at all carries provenance. If none does, the clock starts at that apply (`npm-trust-track`), so a publisher that already expired is recreated within two days instead of failing the next release. Archived repos are skipped: their workflow can't run, so there is nothing to confirm. Removing `trustedPublishing` from a package drops its tracking entry.
+Publishers seen for the first time without a `setAt`, such as state from before this feature or a fresh `seed`/`resync`, are confirmed if any version at all was published through them. If none was, the clock starts at that apply (`npm-trust-track`), so a publisher that already expired is recreated within two days instead of failing the next release. Archived repos are skipped: their workflow can't run, so there is nothing to confirm. Removing a workflow from `trustedPublishing` drops its entry, removing `trustedPublishing` drops the package.
 
-Tracking is per package, not per workflow. Adding a second workflow to a confirmed package starts the clock again, and a later renewal recreates both. `seed` and `resync` carry the `npmTrust` map over since nothing on GitHub can rebuild it.
+State from before per-publisher tracking (a single `setAt`/`confirmed` per package) is carried over: the package clock is handed to each publisher. A package that was confirmed stays confirmed. One still on the clock with several publishers needs their ids before it can tell them apart, so its first overdue check lists them on npm (one login, `npm-trust-check` in a dry run) and then confirms or renews each on its own. `seed` and `resync` carry the `npmTrust` map over since nothing on GitHub can rebuild it.
 
 You can also manage the package's npm maintainer list:
 

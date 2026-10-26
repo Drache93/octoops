@@ -2636,7 +2636,16 @@ async function reconcileNpmBlock(org, repo, prev, dry, done) {
   const trust = { ...(prev.npmTrust || {}) }
   if (changed(repo.npm, prev.npm)) {
     const npms = Array.isArray(repo.npm) ? repo.npm : [repo.npm]
-    for (const npm of npms) await reconcileNpm(org, repo.name, npm, dry, trust)
+    const prevs = Array.isArray(prev.npm) ? prev.npm : prev.npm ? [prev.npm] : []
+    // each package is its own unit of change: editing one entry of the list
+    // must not drag every other package through npm auth, maintainers and
+    // trust again
+    for (const npm of npms) {
+      const pkg = npmPackageName(npm, repo.name)
+      const was = prevs.find((p) => npmPackageName(p, repo.name) === pkg)
+      if (was && !changed(npm, was)) continue
+      await reconcileNpm(org, repo.name, npm, dry, trust)
+    }
   }
   // record only after the work succeeded — if reconcileNpm threw (e.g. npm
   // publish failed because not logged in) we leave state unchanged so the
@@ -2694,82 +2703,78 @@ async function reconcileNpm(org, repoName, npm, dry, trust) {
     return ok
   }
 
-  const added = await syncTrustedPublishers(pkg, `${org}/${repoName}`, desired, false)
+  const { current, created } = await syncTrustedPublishers(pkg, `${org}/${repoName}`, desired, new Set())
   // a new publisher starts npm's publish-or-expire clock, see reconcileNpmTrust
-  if (added) trust[pkg] = { setAt: new Date().toISOString(), confirmed: false }
+  trust[pkg] = trackPublishers(current, trust[pkg], created)
 
   return ok
 }
 
-// lists what npm has for the package and converges it on desired. renew throws
-// every publisher of this repo away and recreates it, which is how npm's
-// expiry clock gets reset. returns how many publishers were created
+// lists what npm has for the package and converges it on desired. renew names
+// publishers (by trust key) to throw away and recreate, which is how npm's
+// expiry clock gets reset for one of them without touching the others.
+// returns what npm lists afterwards and the keys that were created
 async function syncTrustedPublishers(pkg, repository, desired, renew) {
-  console.log(
-    '\n  When authenticating with npm, check the box to allow 5 minutes of non-authenticated access.\n'
-  )
+  const current = await listTrustedPublishers(pkg, repository, true)
+  const { stale, add, revoke } = planTrustedPublishers(current, desired, renew)
 
-  // trigger auth interactively
-  await run('npm', ['trust', 'list', pkg], { interactive: true })
-
-  // now re-run piped to capture JSON
-  const listed = parseTrustList(await run('npm', ['trust', 'list', pkg, '--json']))
-
-  // only reconcile what this entry declares: publishers bound to another repo,
-  // or to a provider other than GitHub, are not ours to revoke
-  const current = listed.filter((c) => c.type === 'github' && typeof c.repository === 'string' && sameName(c.repository, repository))
-
-  const { add, revoke } = renew ? { add: desired, revoke: current } : planTrustedPublishers(current, desired)
-
+  for (const c of stale) print(false, 'npm-untrust', pkg, `${c.repository} via ${c.file} (expired)`)
   for (const d of add) print(false, 'npm-trust', pkg, `${d.repository} via ${d.file}`)
   for (const c of revoke) print(false, 'npm-untrust', pkg, `${c.repository} via ${c.file}`)
 
-  const addAll = async () => {
-    for (const d of add) {
-      const setArgs = [
-        'trust',
-        'github',
-        pkg,
-        '--file',
-        d.file,
-        '--repository',
-        d.repository,
-        '--allow-publish',
-        '--yes'
-      ]
-      if (d.environment) setArgs.push('--environment', d.environment)
-      await run('npm', setArgs, { interactive: true })
-    }
+  // an expired publisher goes first, npm refuses to create a triple that
+  // exists and there is nothing to lose. the rest adds before it revokes, so
+  // an interrupted run leaves too many publishers rather than none, and a
+  // failing add aborts before anything is taken away
+  await revokeTrustedPublishers(pkg, stale)
+  await addTrustedPublishers(pkg, add)
+  await revokeTrustedPublishers(pkg, revoke)
+
+  const created = new Set(add.map(trustKey))
+  // npm hands out the ids, so list again to learn the new ones
+  return { current: created.size ? await listTrustedPublishers(pkg, repository, false) : current, created }
+}
+
+// only what this entry could have created: GitHub publishers bound to this
+// repo. one pointing at another repo, or from another provider, is not ours
+async function listTrustedPublishers(pkg, repository, auth) {
+  if (auth) {
+    console.log(
+      '\n  When authenticating with npm, check the box to allow 5 minutes of non-authenticated access.\n'
+    )
+    // trigger auth interactively
+    await run('npm', ['trust', 'list', pkg], { interactive: true })
   }
 
-  const revokeAll = async () => {
-    for (const c of revoke) {
-      if (c.id) await run('npm', ['trust', 'revoke', pkg, '--id', c.id], { interactive: true })
-    }
-  }
+  // now re-run piped to capture JSON
+  const listed = parseTrustList(await run('npm', ['trust', 'list', pkg, '--json']))
+  return listed.filter((c) => c.type === 'github' && typeof c.repository === 'string' && sameName(c.repository, repository))
+}
 
-  // add before revoke so an interrupted run leaves too many publishers rather
-  // than none, and a failing add aborts before anything is taken away. a renewal
-  // has to go the other way round, npm refuses to create a triple that exists
-  if (renew) {
-    await revokeAll()
-    await addAll()
-  } else {
-    await addAll()
-    await revokeAll()
+async function addTrustedPublishers(pkg, publishers) {
+  for (const d of publishers) {
+    const args = ['trust', 'github', pkg, '--file', d.file, '--repository', d.repository, '--allow-publish', '--yes']
+    if (d.environment) args.push('--environment', d.environment)
+    await run('npm', args, { interactive: true })
   }
+}
 
-  return add.length
+async function revokeTrustedPublishers(pkg, publishers) {
+  for (const c of publishers) {
+    if (c.id) await run('npm', ['trust', 'revoke', pkg, '--id', c.id], { interactive: true })
+  }
 }
 
 // npm expires a trusted publisher that has not published within two days of
-// being created. we cannot see that clock, so state keeps our own: when octoops
-// last created the publishers for a package, and whether the registry has seen
-// a trusted publish since (which only the publisher can produce). confirmed
-// packages are never looked at again. unconfirmed ones are left alone until our
-// clock says npm's has run out, then the registry decides: a trusted publish
-// confirms them, otherwise the publishers are recreated. so a package costs at
-// most one registry read per window, and a steady-state apply costs none
+// being created. we cannot see that clock, so state keeps our own per
+// publisher: when octoops created it, and whether the registry has seen a
+// publish through it since. the registry names the publisher config behind
+// each trusted publish, so one workflow confirming does not vouch for its
+// siblings, and renewing one leaves the others alone. confirmed publishers
+// are never looked at again. unconfirmed ones are left alone until our clock
+// says npm's has run out, then the registry decides: a trusted publish
+// confirms them, otherwise they are recreated. so a package costs at most one
+// registry read per window, and a steady-state apply costs none
 const NPM_TRUST_RENEW_AFTER = 40 * 60 * 60 * 1000
 // setAt is this machine's clock, the publish times are the registry's
 const NPM_TRUST_CLOCK_SLACK = 10 * 60 * 1000
@@ -2800,11 +2805,11 @@ async function reconcileNpmTrust(org, repo, prev, dry, done, opts) {
 }
 
 async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
-  const entry = trust[pkg]
-  if (entry && entry.confirmed) return
+  const entries = trackPublishers(desired, trust[pkg])
+  trust[pkg] = entries
 
-  const setAt = entry && entry.setAt ? Date.parse(entry.setAt) : 0
-  if (setAt && Date.now() - setAt < NPM_TRUST_RENEW_AFTER) return
+  const due = entries.filter((e) => !e.confirmed && (!e.setAt || Date.now() - Date.parse(e.setAt) >= NPM_TRUST_RENEW_AFTER))
+  if (!due.length) return
 
   let packument
   try {
@@ -2815,36 +2820,85 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
     return
   }
 
-  // first sight of this package, state predates the tracking or was seeded.
-  // any trusted publish proves the publisher works, otherwise the clock
-  // starts now since nothing can say when npm's did
-  if (!setAt) {
-    if (hasTrustedPublishSince(packument, 0)) {
-      print(dry, 'npm-trust-confirmed', pkg, 'trusted publish found')
-      trust[pkg] = { confirmed: true }
-    } else {
-      print(dry, 'npm-trust-track', pkg, 'no trusted publish yet')
-      trust[pkg] = { setAt: new Date().toISOString(), confirmed: false }
+  const publishes = trustedPublishes(packument)
+  // a lone publisher owns every trusted publish, siblings are told apart by
+  // the id npm gave them. state from before ids has to learn them from npm
+  const single = entries.length === 1
+  const unknown = due.filter((e) => e.setAt && !e.id)
+  if (!single && unknown.length) {
+    if (dry) {
+      for (const e of unknown) print(dry, 'npm-trust-check', pkg, publisherLabel(e) + ': id unknown, resolved on apply')
+      return
     }
-    return
+    const current = await listTrustedPublishers(pkg, repository, true)
+    for (const e of entries) {
+      const c = current.find((c) => trustKey(c) === trustKey(e))
+      if (c && c.id) e.id = c.id
+    }
   }
 
-  if (hasTrustedPublishSince(packument, setAt - NPM_TRUST_CLOCK_SLACK)) {
-    print(dry, 'npm-trust-confirmed', pkg, 'trusted publish after ' + entry.setAt)
-    trust[pkg] = { confirmed: true }
-    return
+  const renew = new Set()
+  const now = new Date().toISOString()
+
+  for (const e of due) {
+    // first sight of this publisher, state predates the tracking or was
+    // seeded. any publish through it proves it works, otherwise the clock
+    // starts now since nothing can say when npm's did
+    const since = e.setAt ? Date.parse(e.setAt) - NPM_TRUST_CLOCK_SLACK : 0
+    const used = publishes.some((p) => p.time >= since && (single || p.id === e.id))
+    if (used) {
+      print(dry, 'npm-trust-confirmed', pkg, publisherLabel(e) + ': trusted publish ' + (e.setAt ? 'after ' + e.setAt : 'found'))
+      e.confirmed = true
+    } else if (!e.setAt) {
+      print(dry, 'npm-trust-track', pkg, publisherLabel(e) + ': no trusted publish yet')
+      e.setAt = now
+    } else if (opts.renew === false) {
+      print(dry, 'npm-trust-expired', pkg, publisherLabel(e) + ': set ' + e.setAt + ', not renewing')
+    } else {
+      print(dry, 'npm-trust-renew', pkg, publisherLabel(e) + ': no trusted publish since ' + e.setAt)
+      renew.add(trustKey(e))
+    }
   }
 
-  if (opts.renew === false) {
-    print(dry, 'npm-trust-expired', pkg, 'set ' + entry.setAt + ', not renewing')
-    return
-  }
+  if (!renew.size) return
 
-  print(dry, 'npm-trust-renew', pkg, 'no trusted publish since ' + entry.setAt)
+  // a publish since the oldest clock that none of our ids account for means
+  // the ids do not line up, or someone else publishes here. say so rather
+  // than renew in silence
+  const oldest = Math.min(...due.filter((e) => renew.has(trustKey(e))).map((e) => Date.parse(e.setAt)))
+  const foreign = publishes.filter((p) => p.time >= oldest - NPM_TRUST_CLOCK_SLACK && !entries.some((e) => e.id === p.id))
+  if (foreign.length) print(dry, 'npm-trust-unmatched', pkg, foreign.length + ' trusted publish(es) from a publisher this repo does not track')
+
   if (dry) return
 
-  await syncTrustedPublishers(pkg, repository, desired, true)
-  trust[pkg] = { setAt: new Date().toISOString(), confirmed: false }
+  const { current, created } = await syncTrustedPublishers(pkg, repository, desired, renew)
+  trust[pkg] = trackPublishers(current, entries, created)
+}
+
+function publisherLabel(e) {
+  return e.file + (e.environment ? ' (' + e.environment + ')' : '')
+}
+
+// one tracking entry per publisher, built from what npm lists (with ids) or
+// from what the config declares (without). created ones start the clock now,
+// known ones keep theirs, and a package-level clock from before ids covers
+// every publisher it had. anything else is first seen and checked next pass
+function trackPublishers(publishers, previous, created = new Set()) {
+  const legacy = previous && !Array.isArray(previous) ? previous : null
+  const known = Array.isArray(previous) ? previous : []
+  const now = new Date().toISOString()
+
+  return publishers.map((p) => {
+    const was = known.find((k) => p.id && k.id === p.id) || known.find((k) => trustKey(k) === trustKey(p))
+    const clock = created.has(trustKey(p)) ? { setAt: now } : was || legacy
+    const entry = {}
+    if (p.id || (was && was.id)) entry.id = p.id || was.id
+    entry.file = p.file
+    entry.environment = p.environment || null
+    if (clock && clock.setAt) entry.setAt = clock.setAt
+    entry.confirmed = !!(clock && clock.confirmed)
+    return entry
+  })
 }
 
 // the full packument, the abbreviated one drops both publish times and attestations.
@@ -2859,24 +2913,21 @@ async function fetchPackument(pkg) {
 }
 
 // the registry marks a version published through a trusted publisher on its
-// _npmUser. a provenance attestation only shows up when the workflow asked for
-// it, so it is a fallback rather than the signal, but a token publish with
-// --provenance proves the same thing closely enough
-function hasTrustedPublishSince(packument, since) {
-  if (!packument) return false
+// _npmUser, along with the id of the publisher config that let it in. a
+// provenance attestation only shows up when the workflow asked for it, so it
+// is a fallback rather than the signal, but a token publish with --provenance
+// proves the same thing closely enough, just not through which publisher
+function trustedPublishes(packument) {
+  if (!packument) return []
   const time = packument.time || {}
+  const publishes = []
   for (const [version, data] of Object.entries(packument.versions || {})) {
-    if (!isTrustedPublish(data)) continue
-    if (Date.parse(time[version]) >= since) return true
+    const trusted = data._npmUser && data._npmUser.trustedPublisher
+    const att = data.dist && data.dist.attestations
+    if (!trusted && !(att && att.provenance)) continue
+    publishes.push({ id: (trusted && trusted.oidcConfigId) || null, time: Date.parse(time[version]) })
   }
-  return false
-}
-
-function isTrustedPublish(data) {
-  const user = data._npmUser
-  if (user && user.trustedPublisher) return true
-  const att = data.dist && data.dist.attestations
-  return !!(att && att.provenance)
+  return publishes
 }
 
 // npm prints one object per publisher, concatenated — never a JSON array — so
@@ -2930,16 +2981,22 @@ function parseTrustList(out) {
   return objects.filter((o) => o && o.type)
 }
 
+// current and desired are already scoped to one repo, so a publisher is its
+// workflow file plus environment. state entries use the same shape
 function trustKey(entry) {
-  return [entry.repository.toLowerCase(), entry.file, entry.environment || null].join('\n')
+  return [entry.file, entry.environment || null].join('\n')
 }
 
-function planTrustedPublishers(current, desired) {
+// stale are the publishers renew asks to recreate and npm still lists (an
+// expired one may already be gone, then it is simply added), add is what is
+// declared but missing or being recreated, revoke what is listed but undeclared
+function planTrustedPublishers(current, desired, renew) {
   const currentKeys = new Set(current.map(trustKey))
   const desiredKeys = new Set(desired.map(trustKey))
 
   return {
-    add: desired.filter((d) => !currentKeys.has(trustKey(d))),
+    stale: current.filter((c) => renew.has(trustKey(c))),
+    add: desired.filter((d) => renew.has(trustKey(d)) || !currentKeys.has(trustKey(d))),
     revoke: current.filter((c) => !desiredKeys.has(trustKey(c)))
   }
 }
