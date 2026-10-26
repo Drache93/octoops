@@ -2808,7 +2808,10 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
   const entries = trackPublishers(desired, trust[pkg])
   trust[pkg] = entries
 
-  const due = entries.filter((e) => !e.confirmed && (!e.setAt || Date.now() - Date.parse(e.setAt) >= NPM_TRUST_RENEW_AFTER))
+  // forcing skips the clock: every unconfirmed publisher gets judged by the
+  // registry now and recreated unless a publish vouches for it
+  const overdue = (e) => !e.setAt || opts.forceRenew || Date.now() - Date.parse(e.setAt) >= NPM_TRUST_RENEW_AFTER
+  const due = entries.filter((e) => !e.confirmed && overdue(e))
   if (!due.length) return
 
   let packument
@@ -2849,13 +2852,13 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
     if (used) {
       print(dry, 'npm-trust-confirmed', pkg, publisherLabel(e) + ': trusted publish ' + (e.setAt ? 'after ' + e.setAt : 'found'))
       e.confirmed = true
-    } else if (!e.setAt) {
+    } else if (!e.setAt && !opts.forceRenew) {
       print(dry, 'npm-trust-track', pkg, publisherLabel(e) + ': no trusted publish yet')
       e.setAt = now
     } else if (opts.renew === false) {
       print(dry, 'npm-trust-expired', pkg, publisherLabel(e) + ': set ' + e.setAt + ', not renewing')
     } else {
-      print(dry, 'npm-trust-renew', pkg, publisherLabel(e) + ': no trusted publish since ' + e.setAt)
+      print(dry, 'npm-trust-renew', pkg, publisherLabel(e) + (e.setAt ? ': no trusted publish since ' + e.setAt : ': no trusted publish, forced'))
       renew.add(trustKey(e))
     }
   }
@@ -2865,7 +2868,7 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
   // a publish since the oldest clock that none of our ids account for means
   // the ids do not line up, or someone else publishes here. say so rather
   // than renew in silence
-  const oldest = Math.min(...due.filter((e) => renew.has(trustKey(e))).map((e) => Date.parse(e.setAt)))
+  const oldest = Math.min(...due.filter((e) => renew.has(trustKey(e))).map((e) => (e.setAt ? Date.parse(e.setAt) : 0)))
   const foreign = publishes.filter((p) => p.time >= oldest - NPM_TRUST_CLOCK_SLACK && !entries.some((e) => e.id === p.id))
   if (foreign.length) print(dry, 'npm-trust-unmatched', pkg, foreign.length + ' trusted publish(es) from a publisher this repo does not track')
 

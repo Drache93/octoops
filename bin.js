@@ -11,6 +11,7 @@ const applyCmd = command(
   flag('--audit', 'Write an audit log to audits/<timestamp>.log'),
   flag('--enterprise', 'Enable enterprise features (env reviewers on private repos)'),
   flag('--no-renew', 'Do not recreate expired npm trusted publishers'),
+  flag('--force-renew', 'Recreate every npm trusted publisher the registry has not confirmed, without waiting for the clock'),
   flag('--invalidate [names]', 'Comma-separated secret names to prompt for and set again'),
   arg('<config>', 'Path to config JSON file or manifest with "includes"'),
   async function () {
@@ -28,6 +29,7 @@ const applyCmd = command(
         audit: applyCmd.flags.audit,
         enterprise: applyCmd.flags.enterprise,
         renew: applyCmd.flags.renew,
+        forceRenew: applyCmd.flags.forceRenew,
         invalidate: applyCmd.flags.invalidate ? applyCmd.flags.invalidate.split(',') : []
       })
     }
