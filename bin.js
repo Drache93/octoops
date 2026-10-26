@@ -2,7 +2,7 @@
 
 const { command, summary, flag, arg } = require('paparam')
 const path = require('path')
-const { apply, importOrg, seed, filter, resync, loadConfig, renameRepo, expandIncludes } = require('.')
+const { apply, importOrg, seed, filter, resync, loadConfig, renameRepo, expandIncludes, listNpmTrust } = require('.')
 
 const applyCmd = command(
   'apply',
@@ -143,6 +143,34 @@ const filterCmd = command(
   }
 )
 
+const npmTrustCmd = command(
+  'npm-trust',
+  summary('List npm trusted publishers and whether the registry has confirmed them'),
+  arg('<config>', 'Path to config JSON file or manifest with "includes"'),
+  flag('--unconfirmed', 'Only publishers the registry has not confirmed yet'),
+  function () {
+    const root = path.resolve(npmTrustCmd.args.config)
+    const hours = (ms) => Math.round(ms / 36e5) + 'h'
+    for (const configPath of expandIncludes(root)) {
+      const config = loadConfig(configPath)
+      const statePath = configPath.replace(/\.json$/, '.state.json')
+      for (const e of listNpmTrust(config, statePath)) {
+        if (e.confirmed && npmTrustCmd.flags.unconfirmed) continue
+        const where = e.file + (e.environment ? ' (' + e.environment + ')' : '')
+        let status
+        if (e.confirmed) status = 'confirmed, published after ' + e.setAt
+        else if (e.archived) status = 'unconfirmed, repo archived so never checked'
+        else if (!e.setAt) status = 'unconfirmed, not tracked yet, checked on next apply'
+        else {
+          const left = Date.parse(e.setAt) + 40 * 36e5 - Date.now()
+          status = 'unconfirmed, set ' + e.setAt + (left > 0 ? ', checked in ' + hours(left) : ', due for check')
+        }
+        console.log(e.repo + ' ' + e.pkg + ' ' + where + ': ' + status)
+      }
+    }
+  }
+)
+
 const cmd = command(
   'octoops',
   summary('Declarative GitHub repo configuration using the gh CLI'),
@@ -152,7 +180,8 @@ const cmd = command(
   resyncCmd,
   listCmd,
   filterCmd,
-  renameCmd
+  renameCmd,
+  npmTrustCmd
 )
 
 cmd.parse()

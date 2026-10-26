@@ -11,7 +11,7 @@ const PERMISSIONS = {
   admin: 'admin'
 }
 
-module.exports = { apply, importOrg, seed, filter, resync, loadConfig, renameRepo, expandIncludes }
+module.exports = { apply, importOrg, seed, filter, resync, loadConfig, renameRepo, expandIncludes, listNpmTrust }
 
 const MERGE_QUEUE_METHODS = new Set(['MERGE', 'SQUASH', 'REBASE'])
 const MERGE_QUEUE_GROUPINGS = new Set(['ALLGREEN', 'HEADGREEN'])
@@ -2825,9 +2825,11 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
 
   const publishes = trustedPublishes(packument)
   // a lone publisher owns every trusted publish, siblings are told apart by
-  // the id npm gave them. state from before ids has to learn them from npm
+  // the id npm gave them. state from before ids has to learn them from npm,
+  // and so does a publisher seen for the first time: without its id no past
+  // publish can be credited to it, and its clock would start now instead
   const single = entries.length === 1
-  const unknown = due.filter((e) => e.setAt && !e.id)
+  const unknown = due.filter((e) => !e.id)
   if (!single && unknown.length) {
     if (dry) {
       for (const e of unknown) print(dry, 'npm-trust-check', pkg, publisherLabel(e) + ': id unknown, resolved on apply')
@@ -2836,7 +2838,7 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
     const current = await listTrustedPublishers(pkg, repository, true)
     for (const e of entries) {
       const c = current.find((c) => trustKey(c) === trustKey(e))
-      if (c && c.id) e.id = c.id
+      if (c && c.id) e.id = publisherId(c.id)
     }
   }
 
@@ -2848,9 +2850,12 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
     // seeded. any publish through it proves it works, otherwise the clock
     // starts now since nothing can say when npm's did
     const since = e.setAt ? Date.parse(e.setAt) - NPM_TRUST_CLOCK_SLACK : 0
-    const used = publishes.some((p) => p.time >= since && (single || p.id === e.id))
-    if (used) {
+    const proof = publishes.filter((p) => p.time >= since && (single || p.id === e.id))
+    if (proof.length) {
       print(dry, 'npm-trust-confirmed', pkg, publisherLabel(e) + ': trusted publish ' + (e.setAt ? 'after ' + e.setAt : 'found'))
+      // the publisher existed by its first publish, so a clock that was never
+      // recorded starts there and the confirmation stays re-derivable
+      if (!e.setAt) e.setAt = new Date(Math.min(...proof.map((p) => p.time))).toISOString()
       e.confirmed = true
     } else if (!e.setAt && !opts.forceRenew) {
       print(dry, 'npm-trust-track', pkg, publisherLabel(e) + ': no trusted publish yet')
@@ -2878,6 +2883,37 @@ async function checkNpmTrust(pkg, repository, desired, trust, dry, opts) {
   trust[pkg] = trackPublishers(current, entries, created)
 }
 
+// every trusted publisher a config declares, joined with what state knows
+// about it, the same way an apply would see them. offline: nothing is asked
+// of npm or the registry, so this is the cheap way to find out which
+// publishers are still waiting on a trusted publish before the clock runs out
+function listNpmTrust(config, statePath) {
+  const state = loadState(statePath)
+  const presets = config.presets || {}
+  const out = []
+
+  for (const raw of config.repos || []) {
+    if (raw.deleted === true) continue
+    const repo = resolve(resolveDefaults(raw, config.defaults), presets)
+    if (!repo.npm) continue
+    const prev = state[config.org + '/' + repo.name] || {}
+    const trust = prev.npmTrust || {}
+    const npms = Array.isArray(repo.npm) ? repo.npm : [repo.npm]
+
+    for (const npm of npms) {
+      if (!npm.trustedPublishing) continue
+      const desired = desiredTrustedPublishers(config.org, repo.name, npm.trustedPublishing)
+      if (!desired.length) continue
+      const pkg = npmPackageName(npm, repo.name)
+      for (const e of trackPublishers(desired, trust[pkg])) {
+        out.push({ repo: config.org + '/' + repo.name, archived: repo.archived === true, pkg, ...e })
+      }
+    }
+  }
+
+  return out
+}
+
 function publisherLabel(e) {
   return e.file + (e.environment ? ' (' + e.environment + ')' : '')
 }
@@ -2885,7 +2921,11 @@ function publisherLabel(e) {
 // one tracking entry per publisher, built from what npm lists (with ids) or
 // from what the config declares (without). created ones start the clock now,
 // known ones keep theirs, and a package-level clock from before ids covers
-// every publisher it had. anything else is first seen and checked next pass
+// every publisher it had. anything else is first seen and checked next pass.
+// a confirmation is only trusted alongside the clock it was proven against:
+// a package-level one only said that some publisher of the package had
+// published, and an entry confirmed without a clock has nothing to re-derive
+// the proof from, so both get proven again through the registry
 function trackPublishers(publishers, previous, created = new Set()) {
   const legacy = previous && !Array.isArray(previous) ? previous : null
   const known = Array.isArray(previous) ? previous : []
@@ -2895,11 +2935,11 @@ function trackPublishers(publishers, previous, created = new Set()) {
     const was = known.find((k) => p.id && k.id === p.id) || known.find((k) => trustKey(k) === trustKey(p))
     const clock = created.has(trustKey(p)) ? { setAt: now } : was || legacy
     const entry = {}
-    if (p.id || (was && was.id)) entry.id = p.id || was.id
+    if (p.id || (was && was.id)) entry.id = publisherId(p.id || was.id)
     entry.file = p.file
     entry.environment = p.environment || null
     if (clock && clock.setAt) entry.setAt = clock.setAt
-    entry.confirmed = !!(clock && clock.confirmed)
+    entry.confirmed = !!(was && was.confirmed && was.setAt)
     return entry
   })
 }
@@ -2928,9 +2968,16 @@ function trustedPublishes(packument) {
     const trusted = data._npmUser && data._npmUser.trustedPublisher
     const att = data.dist && data.dist.attestations
     if (!trusted && !(att && att.provenance)) continue
-    publishes.push({ id: (trusted && trusted.oidcConfigId) || null, time: Date.parse(time[version]) })
+    publishes.push({ id: publisherId(trusted && trusted.oidcConfigId), time: Date.parse(time[version]) })
   }
   return publishes
+}
+
+// the registry used to prefix the publisher config id with its provider, npm
+// trust list never did, so strip it before the two are compared
+function publisherId(id) {
+  if (!id) return null
+  return String(id).replace(/^oidc:/, '')
 }
 
 // npm prints one object per publisher, concatenated — never a JSON array — so

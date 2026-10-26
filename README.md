@@ -871,9 +871,18 @@ npm deletes a trusted publisher that hasn't published anything within two days o
 
 So a steady-state apply makes no registry requests at all, and a package costs at most one per window.
 
+To see every publisher and where it stands, without touching npm or the registry:
+
+```bash
+octoops npm-trust config.json                 # every publisher, with its clock
+octoops npm-trust config.json --unconfirmed   # only those still waiting on a trusted publish
+```
+
+It takes a manifest with `includes` as well, and reads the same state an apply would. A `confirmed` entry means the registry has seen a publish through that publisher after `setAt`, which npm never expires. It does not mean the publisher still exists: one revoked by hand on npm, or revoked and recreated, looks the same from the outside. Only `npm trust list` can tell, so if that might have happened, edit the `npm` block (or `seed` the repo) to force a resync.
+
 Publishers seen for the first time without a `setAt`, such as state from before this feature or a fresh `seed`/`resync`, are confirmed if any version at all was published through them. If none was, the clock starts at that apply (`npm-trust-track`), so a publisher that already expired is recreated within two days instead of failing the next release. Archived repos are skipped: their workflow can't run, so there is nothing to confirm. Removing a workflow from `trustedPublishing` drops its entry, removing `trustedPublishing` drops the package.
 
-State from before per-publisher tracking (a single `setAt`/`confirmed` per package) is carried over: the package clock is handed to each publisher. A package that was confirmed stays confirmed. One still on the clock with several publishers needs their ids before it can tell them apart, so its first overdue check lists them on npm (one login, `npm-trust-check` in a dry run) and then confirms or renews each on its own. `seed` and `resync` carry the `npmTrust` map over since nothing on GitHub can rebuild it.
+State from before per-publisher tracking (a single `setAt`/`confirmed` per package) is carried over: the package clock is handed to each publisher. A package-level confirmation is not: it only said that some publisher of the package had published, so each publisher is proven again through its own id on the next apply, and `setAt` is backfilled from the first publish that proved it. The same goes for any `confirmed` entry without a `setAt`, there is nothing to re-derive the proof from. A package with several publishers needs their ids before it can tell them apart, so its first check lists them on npm (one login, `npm-trust-check` in a dry run) and then confirms or renews each on its own. `seed` and `resync` carry the `npmTrust` map over since nothing on GitHub can rebuild it.
 
 You can also manage the package's npm maintainer list:
 
