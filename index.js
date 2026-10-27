@@ -3557,8 +3557,22 @@ function print(dry, action, target, detail) {
   audit(line)
 }
 
-function gh(args, opts) {
-  return run('gh', args, opts)
+// github locks a repo briefly during transfers, renames and right after
+// create. the lock clears on its own but can hold for a while, so keep
+// trying for about a minute
+const LOCKED_RETRIES = 30
+const LOCKED_WAIT = 2000
+
+async function gh(args, opts) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await run('gh', args, opts)
+    } catch (err) {
+      if (attempt >= LOCKED_RETRIES || !/Repository has been locked/.test(err.message)) throw err
+      console.log(`repository locked, retrying in ${LOCKED_WAIT / 1000}s (${attempt + 1}/${LOCKED_RETRIES})...`)
+      await new Promise((resolve) => setTimeout(resolve, LOCKED_WAIT))
+    }
+  }
 }
 
 function run(cmd, args, opts = {}) {
