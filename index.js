@@ -2774,8 +2774,12 @@ async function revokeTrustedPublishers(pkg, publishers) {
 // are never looked at again. unconfirmed ones are left alone until our clock
 // says npm's has run out, then the registry decides: a trusted publish
 // confirms them, otherwise they are recreated. so a package costs at most one
-// registry read per window, and a steady-state apply costs none
-const NPM_TRUST_RENEW_AFTER = 40 * 60 * 60 * 1000
+// registry read per window, and a steady-state apply costs none.
+// npm gives a publisher two days, the renewal age sets how far apart applies
+// may be and still catch it in time: twelve hours leaves a day and a half,
+// which suits applies run by hand. the cost is a recreate per apply past that
+// age, and only for publishers that have never published
+const NPM_TRUST_RENEW_AFTER = 12 * 60 * 60 * 1000
 // setAt is this machine's clock, the publish times are the registry's
 const NPM_TRUST_CLOCK_SLACK = 10 * 60 * 1000
 
@@ -2793,6 +2797,11 @@ async function reconcileNpmTrust(org, repo, prev, dry, done, opts) {
       if (!desired.length) continue
       const pkg = npmPackageName(npm, repo.name)
       tracked.add(pkg)
+      // a deprecated package is not expected to release again, so a publisher
+      // that never published is left to expire rather than recreated every
+      // window. its entry and clock stay, lifting the deprecation makes it
+      // overdue at once and the next apply judges it
+      if (npm.deprecated) continue
       await checkNpmTrust(pkg, `${org}/${repo.name}`, desired, trust, dry, opts)
     }
   }
@@ -2906,7 +2915,10 @@ function listNpmTrust(config, statePath) {
       if (!desired.length) continue
       const pkg = npmPackageName(npm, repo.name)
       for (const e of trackPublishers(desired, trust[pkg])) {
-        out.push({ repo: config.org + '/' + repo.name, archived: repo.archived === true, pkg, ...e })
+        const entry = { repo: config.org + '/' + repo.name, archived: repo.archived === true, deprecated: !!npm.deprecated, pkg, ...e }
+        // when an apply starts asking the registry about it
+        if (e.setAt && !e.confirmed) entry.dueAt = new Date(Date.parse(e.setAt) + NPM_TRUST_RENEW_AFTER).toISOString()
+        out.push(entry)
       }
     }
   }

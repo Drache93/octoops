@@ -160,9 +160,10 @@ const npmTrustCmd = command(
         let status
         if (e.confirmed) status = 'confirmed, published after ' + e.setAt
         else if (e.archived) status = 'unconfirmed, repo archived so never checked'
+        else if (e.deprecated) status = 'unconfirmed, package deprecated so not renewed'
         else if (!e.setAt) status = 'unconfirmed, not tracked yet, checked on next apply'
         else {
-          const left = Date.parse(e.setAt) + 40 * 36e5 - Date.now()
+          const left = Date.parse(e.dueAt) - Date.now()
           status = 'unconfirmed, set ' + e.setAt + (left > 0 ? ', checked in ' + hours(left) : ', due for check')
         }
         console.log(e.repo + ' ' + e.pkg + ' ' + where + ': ' + status)
