@@ -1226,8 +1226,9 @@ function repoChanged(repo, prev, opts) {
   if ((repo.githubPackages || prev.githubPackages) && changed(repo.githubPackages, prev.githubPackages)) return true
   if (repo.actionsAccess !== undefined && repo.actionsAccess !== prev.actionsAccess) return true
   if (repo.forkPrContributorApproval !== undefined && repo.forkPrContributorApproval !== prev.forkPrContributorApproval) return true
-  if (repo.secrets && secretsChanged(repo.secrets, prev.secrets, opts)) return true
-  if (repo.environments && repo.environments.some((e) => e.secrets && secretsChanged(e.secrets, (prev.envSecrets || {})[e.name], opts))) return true
+  if ((repo.secrets || prev.secrets) && secretsChanged(repo.secrets || [], prev.secrets, opts)) return true
+  if (repo.environments && repo.environments.some((e) => (e.secrets || (prev.envSecrets || {})[e.name]) && secretsChanged(e.secrets || [], (prev.envSecrets || {})[e.name], opts))) return true
+  if (prev.envSecrets && !repo.environments) return true
   if (repo.init && !prev.initialized) return true
   return false
 }
@@ -1306,10 +1307,10 @@ async function reconcile(org, repo, prev, dry, done, opts) {
   }
   if (repo.forkPrContributorApproval !== undefined) done.forkPrContributorApproval = repo.forkPrContributorApproval
 
-  if (repo.topics && changed(repo.topics, prev.topics)) {
-    await reconcileTopics(org, repo.name, repo.topics, dry)
+  if ((repo.topics || prev.topics) && changed(repo.topics, prev.topics)) {
+    await reconcileTopics(org, repo.name, repo.topics || [], dry)
   }
-  if (repo.topics) done.topics = repo.topics
+  done.topics = repo.topics
 
   if ((repo.teams || prev.teams) && changed(repo.teams, prev.teams)) {
     done.teams = await reconcileTeams(org, repo.name, repo.teams || [], prev.teams, dry)
@@ -1347,13 +1348,21 @@ async function reconcile(org, repo, prev, dry, done, opts) {
     const hasReviewers = (repo.environments || []).some((e) => e.reviewers && e.reviewers.length)
     const skip = hasReviewers && repo.private !== false && !opts.enterprise
 
+    // deleting takes its secrets and branch policies with it on GitHub
+    const desiredEnvs = new Set((repo.environments || []).map((e) => e.name))
+    for (const env of prev.environments || []) {
+      if (desiredEnvs.has(env.name)) continue
+      print(dry, 'remove-environment', `${org}/${repo.name}`, env.name)
+      if (!dry) await ghIgnoreNotFound(['api', `repos/${org}/${repo.name}/environments/${env.name}`, '--method', 'DELETE'])
+    }
+
     if (skip) {
       print(dry, 'skip-environments', `${org}/${repo.name}`, 'requires enterprise for private repos with reviewers')
     } else {
       for (const env of repo.environments || []) {
         await reconcileEnvironment(org, repo.name, env, dry)
       }
-      if (repo.environments) done.environments = repo.environments
+      done.environments = repo.environments
     }
   }
 
@@ -1376,18 +1385,28 @@ async function reconcile(org, repo, prev, dry, done, opts) {
   }
   if (repo.githubPackages) done.githubPackages = repo.githubPackages
 
-  if (repo.secrets) {
-    done.secrets = await reconcileSecrets(org, repo.name, repo.secrets, prev.secrets, dry, null, opts)
+  if (repo.secrets || prev.secrets) {
+    const next = await reconcileSecrets(org, repo.name, repo.secrets || [], prev.secrets, dry, null, opts)
+    done.secrets = repo.secrets ? next : undefined
   }
 
-  if (repo.environments) {
+  if (repo.environments || prev.envSecrets) {
     const envSecrets = prev.envSecrets || {}
     const newEnvSecrets = {}
-    for (const env of repo.environments) {
-      if (!env.secrets) continue
-      newEnvSecrets[env.name] = await reconcileSecrets(org, repo.name, env.secrets, envSecrets[env.name], dry, env.name, opts)
+    const desiredEnvNames = new Set((repo.environments || []).map((e) => e.name))
+    for (const env of repo.environments || []) {
+      if (!env.secrets && !envSecrets[env.name]) continue
+      newEnvSecrets[env.name] = await reconcileSecrets(org, repo.name, env.secrets || [], envSecrets[env.name], dry, env.name, opts)
+      if (!env.secrets) delete newEnvSecrets[env.name]
     }
-    if (Object.keys(newEnvSecrets).length) done.envSecrets = newEnvSecrets
+    // a removed environment took its secrets with it. secrets state knows for
+    // an environment it never recorded are deleted one by one
+    const wasEnv = new Set((prev.environments || []).map((e) => e.name))
+    for (const envName of Object.keys(envSecrets)) {
+      if (desiredEnvNames.has(envName) || wasEnv.has(envName)) continue
+      await reconcileSecrets(org, repo.name, [], envSecrets[envName], dry, envName, opts)
+    }
+    done.envSecrets = Object.keys(newEnvSecrets).length ? newEnvSecrets : undefined
   }
 }
 
@@ -1870,6 +1889,35 @@ async function reconcileApps(org, desired, prev, dry) {
         } catch (err) {
           if (!/Not Found/.test(err.message)) throw err
         }
+      }
+    }
+  }
+
+  // an app gone from the config loses the repos an apply gave it. all-repos
+  // access is a UI toggle, there is nothing to take back from here
+  const desiredNames = new Set(desired.map((e) => e.name))
+  for (const entry of prev || []) {
+    if (desiredNames.has(entry.name)) continue
+    if (!Array.isArray(entry.repos)) {
+      print(dry, 'skip-app', `${org}/${entry.name}`, 'all-repos access can only be changed in the UI')
+      continue
+    }
+    const install = bySlug.get(slugify(entry.name))
+    if (!install) {
+      print(dry, 'skip-app', `${org}/${entry.name}`, 'no longer installed')
+      continue
+    }
+    for (const name of entry.repos) {
+      print(dry, 'app-remove-repo', `${org}/${entry.name}`, name)
+      if (!dry) {
+        let repo
+        try {
+          repo = JSON.parse(await gh(['api', `repos/${org}/${name}`]))
+        } catch (err) {
+          if (!/Not Found/.test(err.message)) throw err
+          continue
+        }
+        await ghIgnoreNotFound(['api', `user/installations/${install.id}/repositories/${repo.id}`, '--method', 'DELETE'])
       }
     }
   }
@@ -2632,10 +2680,10 @@ async function ensureNpmPackage(pkg, dry) {
 }
 
 async function reconcileNpmBlock(org, repo, prev, dry, done) {
-  if (!repo.npm) return
+  if (!repo.npm && !prev.npm) return
   const trust = { ...(prev.npmTrust || {}) }
   if (changed(repo.npm, prev.npm)) {
-    const npms = Array.isArray(repo.npm) ? repo.npm : [repo.npm]
+    const npms = Array.isArray(repo.npm) ? repo.npm : repo.npm ? [repo.npm] : []
     const prevs = Array.isArray(prev.npm) ? prev.npm : prev.npm ? [prev.npm] : []
     // each package is its own unit of change: editing one entry of the list
     // must not drag every other package through npm auth, maintainers and
@@ -2645,6 +2693,15 @@ async function reconcileNpmBlock(org, repo, prev, dry, done) {
       const was = prevs.find((p) => npmPackageName(p, repo.name) === pkg)
       if (was && !changed(npm, was)) continue
       await reconcileNpm(org, repo.name, npm, dry, trust)
+    }
+    // a package gone from the config keeps nothing an apply set up for it.
+    // maintainers and deprecation stay, a package needs an owner and the
+    // deprecation was meant for its users, but publishers are revoked
+    const desired = new Set(npms.map((n) => npmPackageName(n, repo.name)))
+    for (const was of prevs) {
+      const pkg = npmPackageName(was, repo.name)
+      if (desired.has(pkg) || trust[pkg] === undefined) continue
+      await dropTrustedPublishers(pkg, `${org}/${repo.name}`, trust, dry)
     }
   }
   // record only after the work succeeded — if reconcileNpm threw (e.g. npm

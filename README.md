@@ -198,6 +198,8 @@ Top-level repo fields for basic settings:
 
 Omitting a field leaves the current GitHub value untouched. Setting it makes octoops reconcile it.
 
+That holds for plain settings. Anything an apply created and recorded in state (teams, collaborators, topics, branch protection, rulesets, environments, secrets, npm trusted publishers, app repo access, org teams, org members, org secrets, runner groups, hosted runners) follows one rule: in state but no longer in the config means it is removed on the next apply. Removing a whole key is the same as emptying it. State is the only thing that drives this, so anything made by hand that no apply ever recorded is left alone; `resync` brings such things into state. The exceptions are a repo entry itself (needs `deleted: true`, see below) and values that cannot be unset, such as npm maintainers and deprecation.
+
 ### Sharing config across files
 
 A config file can `extends` one or more other files. This lets multiple teams share a common base of `defaults`, `presets`, etc:
@@ -402,6 +404,7 @@ Behavior:
 - Errors if the config's scope (`allRepos` vs `repos`) doesn't match the installation's current scope — that toggle is UI-only, with a link in the error to the settings page.
 - For `repos: [...]`, octoops state-tracks the applied list and PUTs/DELETEs individual repos to converge with the desired one. Idempotent PUTs; DELETE 404s are treated as already-removed.
 - Diffed against a normalized (repos sorted) shape, so a no-op apply skips the API calls entirely.
+- An app removed from the config loses the repos state recorded for it (`app-remove-repo`). One with `allRepos` is reported as `skip-app`, that scope is UI-only.
 
 **Token requirements** — this feature has stricter auth than the rest of octoops:
 
@@ -484,6 +487,8 @@ Each entry in `environments` supports:
 - `deploymentBranches` — which refs may deploy to the environment. Omitted means any branch. `"protected"` limits it to protected branches. A list limits it to the given name patterns: a string or `{ "branch": "release/*" }` matches branches, `{ "tag": "v*" }` matches tags. Patterns use GitHub's branch-policy syntax (`*` and `**`). The list is reconciled, so a pattern removed from config is deleted on GitHub
 - `secrets` — list of secret names, see "Secrets" below
 
+An environment in state that is no longer in the config is deleted (`remove-environment`), its secrets and branch policies with it.
+
 ```json
 "environments": [
   { "name": "npm", "reviewers": [{ "team": "release" }], "preventSelfReview": true, "deploymentBranches": ["main", { "tag": "v*" }] },
@@ -514,7 +519,7 @@ Behavior:
 - When stdin is not a terminal (CI, `apply.sh | tee`), octoops prints `skip-secret` for any name that needs a value and leaves it for an interactive run. Deletes still happen, they need no value
 - Dry runs never prompt. They print `prompt-secret NAME` once and `set-secret` per target
 - `import` and `resync` read secret names from GitHub, so state can be rebuilt. A secret deleted by hand disappears from state on resync and is prompted for again on the next apply
-- A repo entry without `secrets` leaves that repo's secrets alone. An empty list deletes every secret state knows about
+- Removing `secrets` from a repo entry, or emptying it, deletes every secret state knows about. Secrets never recorded in state are left alone
 
 ### Org secrets
 
@@ -709,7 +714,7 @@ GitHub flags this API as beta — the parameter shape may change on their side.
 }
 ```
 
-`admins` and `members` are independent. If `admins` is present, only listed users will be admins. If `members` is present, only listed users will be members. Omit either to leave that role unmanaged.
+`admins` and `members` are independent. If `admins` is present, only listed users will be admins. If `members` is present, only listed users will be members. A role never given is unmanaged. Removing one that state has removes everyone it listed from the org, except those still named under the other role.
 
 Removing someone from the org also removes them from all teams. If that person is still listed in a team config, the next apply will re-add them. Make sure `admins`/`members` is the superset of everyone referenced in `teams`.
 
@@ -839,7 +844,7 @@ A single package can also be published by more than one workflow — `trustedPub
 }
 ```
 
-Don't mix the two up: `npm` as an array means several packages from one repo, `trustedPublishing` as an array means several workflows publishing one package. A bare object is shorthand for a one-element list, so existing configs keep working untouched. npm allows up to 10 publishers per package. Each package in the list is diffed against state on its own, so editing or adding one entry only touches that package; the others are not listed, re-authenticated or re-reconciled.
+Don't mix the two up: `npm` as an array means several packages from one repo, `trustedPublishing` as an array means several workflows publishing one package. A bare object is shorthand for a one-element list, so existing configs keep working untouched. npm allows up to 10 publishers per package. Each package in the list is diffed against state on its own, so editing or adding one entry only touches that package; the others are not listed, re-authenticated or re-reconciled. A package removed from the list (or the whole `npm` block) has the publishers state tracks for it revoked (`npm-untrust`); maintainers and deprecation are left as they are.
 
 Publishers reconcile as a set keyed on `(repository, workflow, environment)`. Declared but missing gets added (`npm-trust`), present but undeclared gets revoked (`npm-untrust`), and anything already matching is left alone. A missing `environment` counts as none on both sides, so `undefined`, `null` and `""` never churn. Adds run before revokes, so an interrupted apply leaves a package with too many publishers rather than none. Duplicate entries are collapsed before planning.
 
