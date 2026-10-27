@@ -2680,10 +2680,14 @@ function desiredTrustedPublishers(org, repoName, tp) {
 async function reconcileNpm(org, repoName, npm, dry, trust) {
   const pkg = npmPackageName(npm, repoName)
   const tp = npm.trustedPublishing
+  // publishers still in state were set up by an earlier apply. the entry no
+  // longer declaring them means they are to go, not to be forgotten
+  const dropping = !tp && trust[pkg] !== undefined
 
-  if (!tp && !npm.maintainers && npm.deprecated === undefined) return true
+  if (!tp && !npm.maintainers && npm.deprecated === undefined && !dropping) return true
 
-  await ensureNpmPackage(pkg, dry)
+  // a package that only loses its publishers exists already, no need to look
+  if (!dropping || npm.maintainers || npm.deprecated !== undefined) await ensureNpmPackage(pkg, dry)
 
   let ok = true
   if (npm.maintainers) {
@@ -2694,6 +2698,7 @@ async function reconcileNpm(org, repoName, npm, dry, trust) {
     await reconcileNpmDeprecation(pkg, npm.deprecated, dry)
   }
 
+  if (dropping) await dropTrustedPublishers(pkg, `${org}/${repoName}`, trust, dry)
   if (!tp) return ok
 
   const desired = desiredTrustedPublishers(org, repoName, tp)
@@ -2708,6 +2713,19 @@ async function reconcileNpm(org, repoName, npm, dry, trust) {
   trust[pkg] = trackPublishers(current, trust[pkg], created)
 
   return ok
+}
+
+// revokes every publisher bound to this repo and drops the package from state.
+// what npm actually has is listed first, so one revoked by hand is no error
+async function dropTrustedPublishers(pkg, repository, trust, dry) {
+  if (dry) {
+    const entries = Array.isArray(trust[pkg]) ? trust[pkg] : []
+    if (!entries.length) print(dry, 'npm-untrust', pkg, repository)
+    for (const e of entries) print(dry, 'npm-untrust', pkg, `${repository} via ${e.file}`)
+    return
+  }
+  await syncTrustedPublishers(pkg, repository, [], new Set())
+  delete trust[pkg]
 }
 
 // lists what npm has for the package and converges it on desired. renew names
